@@ -16,7 +16,37 @@ The "remembers" node of the ghostie stack, and the piece that makes the stack's
 sovereignty real: a clean-start rewrite of an earlier Node prototype that
 depended on a hosted agent. This version does not.
 
-Status: early. See `docs/GOAL.md` for the plan and the beads for tracked work.
+## What it does today
+
+A memory is a plain Markdown file with typed frontmatter (fact, decision, or
+rule) plus a body. Beyond the title and tags it carries provenance, which is
+what makes it useful across tools:
+
+- `harness` and `core` record WHERE a memory was made and WHICH model made it,
+  so a note taken in one harness arrives in another with its origin attached.
+- `rationale` (the `--why` flag) is a one-line reason the memory matters,
+  surfaced on the recall card without opening the body.
+
+Recall ranks with a clean-room BM25 (fixed-point integer, no floats), then
+seeds a Personalized PageRank walk with those hits and follows `links` between
+memories. A memory linked to a match surfaces even when it shares no words with
+the query, and it names the edge that carried it. Every hit shows its why.
+`--budget N` caps the result in tokens so a context-injection hook never
+floods; `--scope` keeps recall focused on one project.
+
+```sh
+ghostie remember --type decision "Chose DuckDB over Postgres" \
+  --why "we'll hit this again porting the ingest service" \
+  --harness hermes --core hermes-4-405b
+ghostie recall "why did we pick duckdb" --budget 800
+```
+
+Retrieval is literal-token today (no stemming or embeddings): near-miss wording
+can miss, which the link graph and a future hash-embedding rerank are meant to
+cover. Capture-on-a-hook and automatic git sync are the next milestone.
+
+Status: the store, provenance, and graph-aware recall are working and gated.
+See `docs/GOAL.md` for the plan and the beads for tracked work.
 
 ## CI
 
