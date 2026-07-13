@@ -300,8 +300,12 @@ fn passes_filters(entry: &crate::store::index::DocEntry, opts: &RecallOpts) -> b
         return false;
     }
     if let Some(scope) = &opts.scope {
+        // A scope filter admits memories in that scope PLUS globally-scoped
+        // ones (no scope, or explicit `global`), so project isolation never
+        // hides the rules you want everywhere. A memory scoped to a DIFFERENT
+        // project is excluded, which is what stops cross-project leakage.
         let entry_scope = entry.scope.as_deref().unwrap_or("global");
-        if entry_scope != scope {
+        if entry_scope != scope && entry_scope != "global" {
             return false;
         }
     }

@@ -31,7 +31,9 @@ use std::path::PathBuf;
 
 /// Subcommands implemented so far, in help order. The robot audit and the
 /// e2e suite iterate THIS list, so a new verb is auto-covered.
-pub const SUBCOMMANDS: [&str; 3] = ["remember", "recall", "list"];
+pub const SUBCOMMANDS: [&str; 7] = [
+    "setup", "remember", "recall", "list", "capture", "sync", "hook",
+];
 
 /// Everything a command run produces; `run` prints it, tests assert on it.
 #[derive(Debug, Default)]
@@ -936,6 +938,8 @@ fn cmd_capture(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk
     let mut path: Option<String> = None;
     let mut harness: Option<String> = None;
     let mut core: Option<String> = None;
+    let mut scope: Option<String> = None;
+    let mut format: Option<capture::Format> = None;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -955,6 +959,22 @@ fn cmd_capture(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk
                         .clone(),
                 );
             }
+            "--scope" => {
+                i += 1;
+                scope = Some(
+                    rest.get(i)
+                        .ok_or_else(|| usage("--scope requires a value".to_string()))?
+                        .clone(),
+                );
+            }
+            "--format" => {
+                i += 1;
+                let v = rest.get(i).ok_or_else(|| {
+                    usage("--format requires auto|claude-code|codex|generic".to_string())
+                })?;
+                format = capture::Format::parse(v)
+                    .ok_or_else(|| usage(format!("unknown --format '{v}'")))?;
+            }
             a if a.starts_with('-') => {
                 return Err(usage(format!("unknown flag '{a}' for capture")));
             }
@@ -972,8 +992,10 @@ fn cmd_capture(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk
     let created = capture::capture_file(
         store,
         &path,
+        format,
         harness.as_deref(),
         core.as_deref(),
+        scope.as_deref(),
         clock.as_ref(),
     )?;
     let items: Vec<Value> = created
@@ -1118,6 +1140,7 @@ fn cmd_hook(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
         "install" => {
             let mut budget = hook::DEFAULT_BUDGET;
             let mut do_sync = false;
+            let mut harness = "claude-code".to_string();
             let mut i = 1;
             while i < rest.len() {
                 match rest[i].as_str() {
@@ -1129,9 +1152,55 @@ fn cmd_hook(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
                             .ok_or_else(|| usage("--budget requires a number".to_string()))?;
                     }
                     "--sync" => do_sync = true,
+                    "--harness" => {
+                        i += 1;
+                        harness = rest
+                            .get(i)
+                            .ok_or_else(|| usage("--harness requires a value".to_string()))?
+                            .clone();
+                    }
                     a => return Err(usage(format!("unknown flag '{a}' for hook install"))),
                 }
                 i += 1;
+            }
+            // Turnkey auto-wiring exists for Claude Code (its settings.json hook
+            // schema is stable and verifiable). The runners themselves are
+            // harness-neutral, so any harness with a pre-prompt / session-end
+            // hook can call them; we print exactly how rather than guess at a
+            // config format we cannot verify.
+            if harness != "claude-code" {
+                let sync_flag = if do_sync { " --sync" } else { "" };
+                let human = format!(
+                    "No turnkey installer for '{harness}' yet (only claude-code).\n\
+                     The runners are harness-neutral. Wire these into {harness}'s hooks:\n\
+                     pre-prompt  ->  ghostie --store {} hook run recall --budget {budget}\n\
+                     session-end ->  ghostie --store {} hook run capture{sync_flag}\n\
+                     capture also works by hand for any harness: ghostie capture <transcript> --harness {harness}\n",
+                    store.root().display(),
+                    store.root().display(),
+                );
+                return Ok(CmdOk {
+                    data: Value::Object(vec![
+                        ("harness".to_string(), Value::string(harness)),
+                        ("turnkey".to_string(), Value::Bool(false)),
+                        (
+                            "recall_command".to_string(),
+                            Value::string(format!(
+                                "ghostie --store {} hook run recall --budget {budget}",
+                                store.root().display()
+                            )),
+                        ),
+                        (
+                            "capture_command".to_string(),
+                            Value::string(format!(
+                                "ghostie --store {} hook run capture{sync_flag}",
+                                store.root().display()
+                            )),
+                        ),
+                    ]),
+                    human,
+                    warnings: Vec::new(),
+                });
             }
             let settings = hook::claude_settings_path()?;
             let rep = hook::install_at(&settings, store.root(), budget, do_sync)?;
@@ -1222,7 +1291,7 @@ fn cmd_setup(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, 
         i += 1;
     }
     let do_sync = remote.is_some();
-    let mut warnings = Vec::new();
+    let warnings: Vec<Warning> = Vec::new();
     let mut steps: Vec<String> = Vec::new();
 
     if let Some(r) = &remote {
@@ -1242,16 +1311,23 @@ fn cmd_setup(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, 
     let mut synced = false;
     if do_sync {
         let clock = resolve_clock()?;
-        match sync::sync(store, clock.as_ref()) {
-            Ok(_) => {
-                synced = true;
-                steps.push("initial sync pushed".to_string());
-            }
-            Err(e) => warnings.push(Warning {
+        // The hooks are installed by now, but setup PROMISES a first push. If
+        // it fails (auth, network, a bad remote, or a conflict), fail loudly
+        // with the real cause and exit code rather than reporting success and
+        // leaving the user believing their memory is backed up. Conflicts keep
+        // exit code 3.
+        sync::sync(store, clock.as_ref()).map_err(|e| match e {
+            Error::Conflict { .. } => e,
+            other => Error::Invalid {
                 origin: "setup".to_string(),
-                message: format!("initial sync skipped ({e}); it will run on session end"),
-            }),
-        }
+                message: format!(
+                    "hooks were installed, but the initial sync failed: {other}. \
+                     Fix the remote and run `ghostie sync`."
+                ),
+            },
+        })?;
+        synced = true;
+        steps.push("initial sync pushed".to_string());
     }
 
     let mut human = String::from(if do_sync {

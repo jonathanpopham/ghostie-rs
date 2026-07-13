@@ -29,6 +29,9 @@ fn ghostie(store: &PathBuf, args: &[&str]) -> Output {
     Command::new(BIN)
         .env("GHOSTIE_TEST_CLOCK", CLOCK)
         .env_remove("GHOSTIE_HOME")
+        // Isolate HOME to the store so `setup`/`hook` never touch the real
+        // ~/.claude during tests.
+        .env("HOME", store)
         .arg("--store")
         .arg(store)
         .args(args)
@@ -184,22 +187,31 @@ fn robot_mode_contract_for_every_subcommand() {
         .map(str::to_string)
         .collect();
     assert!(!subcommands.is_empty());
+    // A transcript so `capture` has something real to read.
+    let transcript = store.join("audit.jsonl");
+    std::fs::write(
+        &transcript,
+        r#"{"type":"user","sessionId":"audit","message":{"role":"user","content":"MEMORY fact: audit probe"}}"#,
+    )
+    .unwrap();
+    let tpath = transcript.to_str().unwrap();
     for sub in &subcommands {
+        // Safe args per verb. Some verbs (sync/hook with no target) legitimately
+        // return a usage error; the robot CONTRACT is that they still emit
+        // exactly one valid JSON envelope, which is what we assert.
         let safe_args: Vec<&str> = match sub.as_str() {
+            "setup" => vec!["setup"], // local-only (HOME is the temp store)
             "remember" => vec!["remember", "--type", "fact", "robot audit memory"],
             "recall" => vec!["recall", "sync branch"],
             "list" => vec!["list"],
+            "capture" => vec!["capture", tpath],
+            "sync" => vec!["sync"],
+            "hook" => vec!["hook", "status"],
             other => panic!("new subcommand '{other}' has no audit args — add them"),
         };
         let mut args = safe_args.clone();
         args.push("--json");
         let o = ghostie(&store, &args);
-        assert!(
-            o.status.success(),
-            "{sub} --json exit code: {:?}, stderr: {}",
-            o.status.code(),
-            stderr(&o)
-        );
         let out = stdout(&o);
         assert_eq!(
             out.lines().count(),
@@ -208,13 +220,23 @@ fn robot_mode_contract_for_every_subcommand() {
         );
         let doc = json::parse(out.trim_end())
             .unwrap_or_else(|e| panic!("{sub}: stdout is not JSON: {e}"));
-        assert_eq!(doc.get("ok").and_then(Value::as_bool), Some(true), "{sub}");
+        let ok = doc.get("ok").and_then(Value::as_bool);
+        assert!(ok.is_some(), "{sub}: envelope has an ok flag");
         assert_eq!(
             doc.get("command").and_then(Value::as_str),
             Some(sub.as_str()),
             "{sub}"
         );
-        assert!(doc.get("data").is_some(), "{sub}: envelope has data");
+        // Success carries data; a usage error carries error. Either is a valid
+        // envelope; both always carry warnings.
+        if ok == Some(true) {
+            assert!(doc.get("data").is_some(), "{sub}: ok envelope has data");
+        } else {
+            assert!(
+                doc.get("error").is_some(),
+                "{sub}: error envelope has error"
+            );
+        }
         assert!(
             doc.get("warnings").is_some(),
             "{sub}: envelope has warnings"

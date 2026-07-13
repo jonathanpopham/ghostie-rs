@@ -88,6 +88,12 @@ pub fn sync_init(store: &Store, remote: &str) -> Result<()> {
             });
         }
     }
+    // Pin the unborn branch to `main` regardless of this machine's
+    // init.defaultBranch, so every ghostie store agrees on one branch and a
+    // second device never pushes an empty `master` past the remote's `main`.
+    if is_unborn(root) {
+        let _ = git(root, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    }
     // A local identity, only if the repo has none (never clobber a real one).
     if git(root, &["config", "user.email"])?
         .stdout
@@ -120,7 +126,20 @@ pub fn sync_init(store: &Store, remote: &str) -> Result<()> {
 /// if absent). The index is rebuildable, so syncing it only makes conflicts.
 fn ensure_gitignore(root: &Path) -> Result<()> {
     let path = root.join(".gitignore");
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    // Only a genuinely-absent file is treated as empty. A decode/permission
+    // error must NOT be silently overwritten (that would drop the user's
+    // existing ignore rules and could stage secrets on the next `git add`).
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(Error::Io {
+                context: "reading existing .gitignore (refusing to overwrite)".to_string(),
+                path: path.display().to_string(),
+                source: e,
+            });
+        }
+    };
     if existing.lines().any(|l| l.trim() == ".index/") {
         return Ok(());
     }
@@ -147,6 +166,30 @@ fn current_branch(root: &Path) -> String {
     }
 }
 
+/// Is HEAD unborn (no commits yet)?
+fn is_unborn(root: &Path) -> bool {
+    !git(root, &["rev-parse", "--verify", "--quiet", "HEAD"])
+        .map(|r| r.ok)
+        .unwrap_or(false)
+}
+
+/// The branch to sync: the remote's default branch when it advertises one (so
+/// two devices agree), otherwise this store's local branch.
+fn sync_branch(root: &Path) -> String {
+    if let Ok(run) = git(root, &["ls-remote", "--symref", "origin", "HEAD"])
+        && run.ok
+    {
+        for line in run.stdout.lines() {
+            if let Some(rest) = line.trim().strip_prefix("ref: refs/heads/")
+                && let Some(name) = rest.split_whitespace().next()
+            {
+                return name.to_string();
+            }
+        }
+    }
+    current_branch(root)
+}
+
 /// Commit local changes, rebase in anything on the remote, and push. A rebase
 /// conflict is aborted and surfaced (exit 3), never auto-resolved.
 pub fn sync(store: &Store, clock: &dyn Clock) -> Result<SyncOutcome> {
@@ -156,6 +199,17 @@ pub fn sync(store: &Store, clock: &dyn Clock) -> Result<SyncOutcome> {
             message: "store is not initialised for sync; run `ghostie sync --init <remote>` first"
                 .to_string(),
         });
+    }
+
+    // Agree on one branch across devices: follow the remote's default branch
+    // when it advertises one, and pin our unborn HEAD to it so the first
+    // commit lands there rather than on this machine's local default.
+    let branch = sync_branch(root);
+    if is_unborn(root) {
+        let _ = git(
+            root,
+            &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
+        );
     }
 
     // Stage everything, then commit only if something changed.
@@ -185,8 +239,6 @@ pub fn sync(store: &Store, clock: &dyn Clock) -> Result<SyncOutcome> {
         }
         committed = true;
     }
-
-    let branch = current_branch(root);
 
     // Fetch, then rebase onto the remote branch if it exists. A fresh remote
     // has no such ref yet, which is fine (nothing to pull).

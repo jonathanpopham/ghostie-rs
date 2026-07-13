@@ -15,7 +15,7 @@ use crate::json::{self, Value};
 use crate::recall::{RecallOpts, recall};
 use crate::store::Store;
 use crate::sync;
-use crate::util::Clock;
+use crate::util::{Clock, format_rfc3339_utc};
 use std::path::{Path, PathBuf};
 
 /// Default token budget for the recall-on-prompt injection (bounded so it
@@ -31,11 +31,18 @@ const CAPTURE_TAIL: &str = "hook run capture";
 // Runners: invoked by the harness with the hook payload on stdin.
 // ---------------------------------------------------------------------------
 
-/// Render recalled memories as compact injection text.
-fn render_context(store: &Store, prompt: &str, budget: usize) -> Result<String> {
+/// Render recalled memories as compact injection text, confined to `scope`
+/// (globally-scoped memories still surface).
+fn render_context(
+    store: &Store,
+    prompt: &str,
+    budget: usize,
+    scope: Option<String>,
+) -> Result<String> {
     let opts = RecallOpts {
         budget_tokens: Some(budget),
         diversify: true,
+        scope,
         ..RecallOpts::default()
     };
     let res = recall(store, prompt, &opts)?;
@@ -57,14 +64,21 @@ fn render_context(store: &Store, prompt: &str, budget: usize) -> Result<String> 
 /// and emit the `additionalContext` document Claude Code injects. Empty output
 /// (no JSON) when there is nothing to add, so a no-hit prompt is untouched.
 pub fn run_recall(store: &Store, stdin: &str, budget: usize) -> Result<String> {
-    let prompt = json::parse(stdin.trim())
-        .ok()
-        .and_then(|v| v.get("prompt").and_then(Value::as_str).map(str::to_string))
-        .unwrap_or_default();
+    let payload = json::parse(stdin.trim()).ok();
+    let prompt = payload
+        .as_ref()
+        .and_then(|v| v.get("prompt").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_string();
     if prompt.trim().is_empty() {
         return Ok(String::new());
     }
-    let ctx = render_context(store, &prompt, budget)?;
+    let scope = scope_from_cwd(
+        payload
+            .as_ref()
+            .and_then(|v| v.get("cwd").and_then(Value::as_str)),
+    );
+    let ctx = render_context(store, &prompt, budget, scope)?;
     if ctx.is_empty() {
         return Ok(String::new());
     }
@@ -89,15 +103,38 @@ pub fn run_capture(store: &Store, stdin: &str, do_sync: bool, clock: &dyn Clock)
     let Some(path) = v.get("transcript_path").and_then(Value::as_str) else {
         return Ok("ghostie: no transcript_path in payload; nothing captured".to_string());
     };
-    let created = capture::capture_file(store, path, Some("claude-code"), None, clock)?;
+    let scope = scope_from_cwd(v.get("cwd").and_then(Value::as_str));
+    // Auto-detect the format (a Claude Code SessionEnd transcript detects as
+    // claude-code and stamps that harness).
+    let created = capture::capture_file(store, path, None, None, None, scope.as_deref(), clock)?;
     let mut msg = format!("ghostie: captured {} memory(ies)", created.len());
     if do_sync && sync::git_available() {
         match sync::sync(store, clock) {
-            Ok(_) => msg.push_str("; synced"),
-            Err(e) => msg.push_str(&format!("; sync skipped ({e})")),
+            Ok(_) => {
+                let _ = std::fs::remove_file(sync_error_path(store));
+                msg.push_str("; synced");
+            }
+            // SessionEnd ignores stdout, so a swallowed error would leave the
+            // user silently un-backed-up. Persist a visible failure marker and
+            // shout on stderr so it cannot rot unnoticed.
+            Err(e) => {
+                let note = format!(
+                    "ghostie sync FAILED at {}: {e}",
+                    format_rfc3339_utc(clock.now_epoch_seconds())
+                );
+                let _ = std::fs::write(sync_error_path(store), format!("{note}\n"));
+                eprintln!("{note}");
+                msg.push_str(&format!("; SYNC FAILED ({e})"));
+            }
         }
     }
     Ok(msg)
+}
+
+/// Where the last sync failure is recorded (cleared on the next success);
+/// `hook status` surfaces it so a stalled backup is visible.
+pub fn sync_error_path(store: &Store) -> std::path::PathBuf {
+    store.root().join(".sync-error")
 }
 
 // ---------------------------------------------------------------------------
@@ -121,22 +158,54 @@ pub struct InstallReport {
     pub backed_up: bool,
 }
 
+/// POSIX single-quote a string so shell metacharacters (`$()`, backticks,
+/// `"`, `\`) in a store path can never be interpreted by the hook shell. A
+/// literal single quote becomes `'\''`.
+fn sh_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 fn recall_command(store_root: &Path, budget: usize) -> String {
     format!(
-        "ghostie --store \"{}\" hook run recall --budget {budget}",
-        store_root.display()
+        "ghostie --store {} hook run recall --budget {budget}",
+        sh_quote(&store_root.display().to_string())
     )
 }
 
 fn capture_command(store_root: &Path, do_sync: bool) -> String {
     let mut c = format!(
-        "ghostie --store \"{}\" hook run capture",
-        store_root.display()
+        "ghostie --store {} hook run capture",
+        sh_quote(&store_root.display().to_string())
     );
     if do_sync {
         c.push_str(" --sync");
     }
     c
+}
+
+/// Derive a retrieval scope from the hook payload's working directory, so
+/// recall and capture are confined to the active project (globally-scoped
+/// memories still pass). `~/work/acme` -> `project:acme`.
+fn scope_from_cwd(cwd: Option<&str>) -> Option<String> {
+    let name = std::path::Path::new(cwd?)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if name.is_empty() {
+        None
+    } else {
+        Some(format!("project:{name}"))
+    }
 }
 
 /// Load a settings file into a top-level object's pairs (empty when the file

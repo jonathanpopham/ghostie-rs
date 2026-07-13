@@ -18,7 +18,36 @@ pub mod memory;
 use crate::error::{Error, Result, Warning};
 use crate::store::memory::{Memory, MemoryType};
 use crate::util::Clock;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+
+/// A memory paired with its actual on-disk path (see [`Store::list_paths`]).
+pub type MemoryPath = (Memory, PathBuf);
+
+/// Replace control characters (newlines, tabs, other C0) in a frontmatter
+/// scalar with a single space, and trim. Frontmatter values are one line by
+/// grammar (docs/FORMAT.md); capture pulls arbitrary transcript text into
+/// titles and markers, so sanitizing here keeps a stray newline from writing
+/// a file that then fails to parse. Bodies are exempt (they may span lines).
+fn sanitize_scalar(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    cleaned.trim().to_string()
+}
+
+/// On Unix, memory files and the store directory hold prompts, decisions, and
+/// rationales that may be sensitive; keep them private to the owner (0600 /
+/// 0700). A no-op elsewhere.
+#[cfg(unix)]
+fn set_private(path: &Path, dir: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if dir { 0o700 } else { 0o600 };
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+#[cfg(not(unix))]
+fn set_private(_path: &Path, _dir: bool) {}
 
 /// Fields for a new memory; the store assigns `id` and `created`.
 #[derive(Debug, Clone, Default)]
@@ -90,47 +119,120 @@ impl Store {
         let mtype = new.mtype.ok_or_else(|| Error::Usage {
             message: "memory type is required".to_string(),
         })?;
-        if new.title.trim().is_empty() {
+        let title = sanitize_scalar(&new.title);
+        if title.is_empty() {
             return Err(Error::Usage {
                 message: "title must not be empty".to_string(),
             });
         }
-        let slug = slugify(&new.title);
+        let slug = slugify(&title);
+        self.ensure_dir()?;
+        // Claim the lowest free disambiguator ATOMICALLY: create_new races
+        // safely, so two concurrent sessions choosing the same title never
+        // pick the same id and clobber each other.
+        let mut n: u64 = 1;
+        let id = loop {
+            let candidate = format!("{}-{}-{}", mtype.as_str(), slug, n);
+            if self.try_reserve(&candidate)? {
+                break candidate;
+            }
+            n += 1;
+        };
+        let memory = Self::build_memory(id, mtype, new, clock);
+        self.write_atomic(&memory)?;
+        self.refresh_index_best_effort();
+        Ok(memory)
+    }
+
+    /// Create a memory with a caller-chosen id, atomically. Returns
+    /// `Ok(None)` if the id already exists (an idempotent no-op), so capture
+    /// can reuse a deterministic `<harness>:<session>` identity and never
+    /// duplicate on a retried or re-run session.
+    pub fn create_with_id(
+        &self,
+        id: &str,
+        new: &NewMemory,
+        clock: &dyn Clock,
+    ) -> Result<Option<Memory>> {
+        let mtype = new.mtype.ok_or_else(|| Error::Usage {
+            message: "memory type is required".to_string(),
+        })?;
+        self.ensure_dir()?;
+        if !self.try_reserve(id)? {
+            return Ok(None);
+        }
+        let memory = Self::build_memory(id.to_string(), mtype, new, clock);
+        self.write_atomic(&memory)?;
+        self.refresh_index_best_effort();
+        Ok(Some(memory))
+    }
+
+    /// Build a validated in-memory `Memory`, sanitizing every frontmatter
+    /// scalar (control characters would corrupt the one-line grammar).
+    fn build_memory(id: String, mtype: MemoryType, new: &NewMemory, clock: &dyn Clock) -> Memory {
+        let opt = |o: &Option<String>| {
+            o.as_ref()
+                .map(|s| sanitize_scalar(s))
+                .filter(|s| !s.is_empty())
+        };
+        Memory {
+            id,
+            mtype,
+            created: clock.now_epoch_seconds(),
+            title: sanitize_scalar(&new.title),
+            tags: new
+                .tags
+                .iter()
+                .map(|t| sanitize_scalar(t))
+                .filter(|t| !t.is_empty())
+                .collect(),
+            links: new.links.clone(),
+            source: opt(&new.source),
+            supersedes: opt(&new.supersedes),
+            harness: opt(&new.harness),
+            core: opt(&new.core),
+            rationale: opt(&new.rationale),
+            scope: opt(&new.scope),
+            unknown_keys: Vec::new(),
+            body: new.body.clone(),
+        }
+    }
+
+    /// Atomically claim `<id>.md` via `create_new`: `Ok(true)` when we created
+    /// it (and it is now private to us), `Ok(false)` when it already existed.
+    fn try_reserve(&self, id: &str) -> Result<bool> {
+        let path = self.memory_path(id);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(_f) => {
+                set_private(&path, false);
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(Error::Io {
+                context: "reserving memory id".to_string(),
+                path: path.display().to_string(),
+                source: e,
+            }),
+        }
+    }
+
+    /// Create the memories directory (and store root) as private on first use.
+    fn ensure_dir(&self) -> Result<()> {
+        let root_existed = self.root.exists();
         let dir = self.memories_dir();
+        let dir_existed = dir.exists();
         std::fs::create_dir_all(&dir).map_err(|e| Error::Io {
             context: "creating memories directory".to_string(),
             path: dir.display().to_string(),
             source: e,
         })?;
-        // Lowest free disambiguator, scanned deterministically from files.
-        let mut n: u64 = 1;
-        loop {
-            let candidate = format!("{}-{}-{}", mtype.as_str(), slug, n);
-            if !self.memory_path(&candidate).exists() {
-                break;
-            }
-            n += 1;
+        if !root_existed {
+            set_private(&self.root, true);
         }
-        let id = format!("{}-{}-{}", mtype.as_str(), slug, n);
-        let memory = Memory {
-            id: id.clone(),
-            mtype,
-            created: clock.now_epoch_seconds(),
-            title: new.title.clone(),
-            tags: new.tags.clone(),
-            links: new.links.clone(),
-            source: new.source.clone(),
-            supersedes: new.supersedes.clone(),
-            harness: new.harness.clone(),
-            core: new.core.clone(),
-            rationale: new.rationale.clone(),
-            scope: new.scope.clone(),
-            unknown_keys: Vec::new(),
-            body: new.body.clone(),
-        };
-        self.write_atomic(&memory)?;
-        self.refresh_index_best_effort();
-        Ok(memory)
+        if !dir_existed {
+            set_private(&dir, true);
+        }
+        Ok(())
     }
 
     /// Keep the derivable index warm after a write, best-effort. Failures
@@ -216,9 +318,17 @@ impl Store {
     /// the listing continues — one typo must not take the store down.
     /// Non-`.md` files and dotfiles are ignored.
     pub fn list(&self, filter: &ListFilter) -> Result<(Vec<Memory>, Vec<Warning>)> {
+        let (pairs, warnings) = self.list_paths(filter)?;
+        Ok((pairs.into_iter().map(|(m, _)| m).collect(), warnings))
+    }
+
+    /// Like [`Store::list`] but pairs each memory with its ACTUAL file path,
+    /// so callers (the index) never reconstruct a path from the frontmatter id
+    /// (which a hand-edit can make disagree with the filename).
+    pub fn list_paths(&self, filter: &ListFilter) -> Result<(Vec<MemoryPath>, Vec<Warning>)> {
         let dir = self.memories_dir();
         let mut warnings = Vec::new();
-        let mut memories = Vec::new();
+        let mut memories: Vec<(Memory, PathBuf)> = Vec::new();
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             // A store with no memories/ yet is an empty store, not an error.
@@ -264,7 +374,7 @@ impl Store {
                     {
                         continue;
                     }
-                    memories.push(memory);
+                    memories.push((memory, path));
                 }
                 Err(e) => warnings.push(Warning {
                     origin: path.display().to_string(),
@@ -273,8 +383,8 @@ impl Store {
             }
         }
         // Paths were filename-sorted; memory ids may disagree with
-        // filenames (hand edits) — sort again by id for the output order.
-        memories.sort_by(|a, b| a.id.cmp(&b.id));
+        // filenames (hand edits), so sort again by id for the output order.
+        memories.sort_by(|a, b| a.0.id.cmp(&b.0.id));
         Ok((memories, warnings))
     }
 
@@ -283,19 +393,19 @@ impl Store {
     /// see a partial file, and dotfiles are ignored by `list`.
     fn write_atomic(&self, memory: &Memory) -> Result<()> {
         let path = self.memory_path(&memory.id);
-        let dir = self.memories_dir();
-        std::fs::create_dir_all(&dir).map_err(|e| Error::Io {
-            context: "creating memories directory".to_string(),
-            path: dir.display().to_string(),
-            source: e,
-        })?;
+        self.ensure_dir()?;
         let bytes = memory.to_doc().serialize();
-        let tmp = dir.join(format!(".tmp-{}.md", memory.id));
+        // Unique temp per process AND id, so two concurrent writers never
+        // share a temp file and cross-write each other's bytes.
+        let tmp = self
+            .memories_dir()
+            .join(format!(".tmp-{}-{}.md", std::process::id(), memory.id));
         std::fs::write(&tmp, bytes.as_bytes()).map_err(|e| Error::Io {
             context: "writing memory file".to_string(),
             path: tmp.display().to_string(),
             source: e,
         })?;
+        set_private(&tmp, false);
         std::fs::rename(&tmp, &path).map_err(|e| Error::Io {
             context: "renaming memory file into place".to_string(),
             path: path.display().to_string(),

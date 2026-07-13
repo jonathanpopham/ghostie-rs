@@ -171,13 +171,21 @@ guard_robot_mode(){
   # Every verb the binary reports must answer --json with exit 0 and a
   # single-line JSON document. Deep validation lives in cargo e2e tests;
   # this proves no verb ships without robot mode.
-  local store="$SCRATCH/robot" sub out
-  mkdir -p "$store"
+  # The contract: every verb answers --json with exactly one JSON envelope,
+  # even when the args yield a usage error (errors still emit the envelope).
+  # HOME is redirected to a scratch dir so setup/hook never touch ~/.claude.
+  local store="$SCRATCH/robot" home="$SCRATCH/robot-home" sub out
+  mkdir -p "$store" "$home"
+  printf '%s\n' '{"type":"user","sessionId":"probe","message":{"role":"user","content":"MEMORY fact: probe"}}' > "$store/t.jsonl"
   for sub in $("$BIN" _subcommands); do
     case "$sub" in
-      remember) out="$("$BIN" --store "$store" remember --type fact "robot probe" --json)" || { echo "  $sub --json exited non-zero"; return 1; } ;;
-      recall)   out="$("$BIN" --store "$store" recall "probe" --json)" || { echo "  $sub --json exited non-zero"; return 1; } ;;
-      list)     out="$("$BIN" --store "$store" list --json)" || { echo "  $sub --json exited non-zero"; return 1; } ;;
+      setup)    out="$(HOME="$home" "$BIN" --store "$store" setup --json || true)" ;;
+      remember) out="$("$BIN" --store "$store" remember --type fact "robot probe" --json || true)" ;;
+      recall)   out="$("$BIN" --store "$store" recall "probe" --json || true)" ;;
+      list)     out="$("$BIN" --store "$store" list --json || true)" ;;
+      capture)  out="$("$BIN" --store "$store" capture "$store/t.jsonl" --json || true)" ;;
+      sync)     out="$("$BIN" --store "$store" sync --json || true)" ;;
+      hook)     out="$(HOME="$home" "$BIN" --store "$store" hook status --json || true)" ;;
       *) echo "  new subcommand '$sub' has no robot audit case — add one"; return 1 ;;
     esac
     if [ -z "$out" ] || [ "${out:0:1}" != "{" ] || [ "$(printf '%s\n' "$out" | wc -l)" -ne 1 ]; then

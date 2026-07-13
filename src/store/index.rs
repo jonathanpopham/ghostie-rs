@@ -79,7 +79,10 @@ pub struct Index {
 
 impl Index {
     /// Index one memory (tokenizes title/tags/body with THE tokenizer).
-    pub fn entry_for(memory: &Memory, file_bytes: &[u8]) -> DocEntry {
+    /// `rel_path` is the memory's ACTUAL store-relative path, passed in rather
+    /// than reconstructed from the id, so a hand-edited id that disagrees with
+    /// the filename still resolves to a readable file.
+    pub fn entry_for(memory: &Memory, rel_path: String, file_bytes: &[u8]) -> DocEntry {
         let title_toks = tokenize(&memory.title);
         let tags_toks = tokenize(&memory.tags.join(" "));
         let body_toks = tokenize(&memory.body);
@@ -91,7 +94,7 @@ impl Index {
         }
         DocEntry {
             id: memory.id.clone(),
-            path: format!("memories/{}.md", memory.id),
+            path: rel_path,
             mtype: memory.mtype,
             title: memory.title.clone(),
             tags: memory.tags.clone(),
@@ -114,16 +117,15 @@ impl Index {
     /// Build a fresh index from every readable memory file. Unreadable
     /// files become warnings (and are simply absent from the index).
     pub fn build(store: &Store) -> Result<(Index, Vec<Warning>)> {
-        let (memories, warnings) = store.list(&crate::store::ListFilter::default())?;
+        let (pairs, warnings) = store.list_paths(&crate::store::ListFilter::default())?;
         let mut docs = BTreeMap::new();
-        for m in &memories {
-            let path = store.memories_dir().join(format!("{}.md", m.id));
-            let bytes = std::fs::read(&path).map_err(|e| Error::Io {
+        for (m, path) in &pairs {
+            let bytes = std::fs::read(path).map_err(|e| Error::Io {
                 context: "reading memory file for indexing".to_string(),
                 path: path.display().to_string(),
                 source: e,
             })?;
-            docs.insert(m.id.clone(), Index::entry_for(m, &bytes));
+            docs.insert(m.id.clone(), Index::entry_for(m, rel_path(path), &bytes));
         }
         Ok((Index { docs }, warnings))
     }
@@ -147,11 +149,10 @@ impl Index {
         };
         let mut fresh = Index::default();
         let mut changed = false;
-        let (memories, mut list_warnings) = store.list(&crate::store::ListFilter::default())?;
+        let (pairs, mut list_warnings) = store.list_paths(&crate::store::ListFilter::default())?;
         warnings.append(&mut list_warnings);
-        for m in &memories {
-            let path = store.memories_dir().join(format!("{}.md", m.id));
-            let bytes = std::fs::read(&path).map_err(|e| Error::Io {
+        for (m, path) in &pairs {
+            let bytes = std::fs::read(path).map_err(|e| Error::Io {
                 context: "reading memory file for freshness check".to_string(),
                 path: path.display().to_string(),
                 source: e,
@@ -162,7 +163,9 @@ impl Index {
                     fresh.docs.insert(m.id.clone(), entry.clone());
                 }
                 _ => {
-                    fresh.docs.insert(m.id.clone(), Index::entry_for(m, &bytes));
+                    fresh
+                        .docs
+                        .insert(m.id.clone(), Index::entry_for(m, rel_path(path), &bytes));
                     changed = true;
                 }
             }
@@ -441,6 +444,17 @@ impl Index {
 /// `<root>/.index/index.json`.
 pub fn index_path(root: &Path) -> PathBuf {
     root.join(".index").join("index.json")
+}
+
+/// The store-relative path (`memories/<filename>`) of a memory file, from its
+/// actual absolute path, so a hand-edited id that disagrees with the filename
+/// still points at the real file.
+fn rel_path(abs: &Path) -> String {
+    let name = abs
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("memories/{name}")
 }
 
 #[cfg(test)]
