@@ -36,6 +36,14 @@ pub struct NewMemory {
     pub source: Option<String>,
     /// Superseded decision id (decision).
     pub supersedes: Option<String>,
+    /// Provenance: which harness created this (`claude-code`, `hermes`).
+    pub harness: Option<String>,
+    /// Provenance: which model/core produced this (`opus-4.8`).
+    pub core: Option<String>,
+    /// Why this memory is necessary / when to apply it (the card's why-line).
+    pub rationale: Option<String>,
+    /// Retrieval scope: `global` or `project:<name>`.
+    pub scope: Option<String>,
     /// Markdown body (may be empty; stored verbatim modulo LF).
     pub body: String,
 }
@@ -113,6 +121,10 @@ impl Store {
             links: new.links.clone(),
             source: new.source.clone(),
             supersedes: new.supersedes.clone(),
+            harness: new.harness.clone(),
+            core: new.core.clone(),
+            rationale: new.rationale.clone(),
+            scope: new.scope.clone(),
             unknown_keys: Vec::new(),
             body: new.body.clone(),
         };

@@ -143,9 +143,11 @@ fn explanation_invariants_corpus_wide() {
                 "{q:?}/{}: contributions must sum to score",
                 h.id
             );
+            // Graph-reached hits have no lexical terms by design (their why is
+            // the edge they came in on); the sum invariant above still holds.
             assert!(
-                !h.explanation.matched_terms.is_empty(),
-                "{q:?}/{}: every hit has a non-empty why",
+                !h.explanation.matched_terms.is_empty() || h.graph_via.is_some(),
+                "{q:?}/{}: every lexical hit has a non-empty why",
                 h.id
             );
             // ignored ∩ matched = ∅

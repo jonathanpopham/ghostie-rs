@@ -128,8 +128,24 @@ fn labeled_queries_hit_their_expected_memories() {
                 );
             }
         }
-        // Every hit must carry a non-empty, sum-exact why.
+        // Every hit must carry a why. A lexical hit's why is its matched
+        // terms (non-empty, sum-exact). A graph-reached hit's why is the edge
+        // it came in on: no lexical terms, but a named seed and real mass.
         for h in &r.hits {
+            if h.graph_via.is_some() {
+                assert!(
+                    h.graph_micros > 0,
+                    "{query:?}: graph hit {} has no graph mass",
+                    h.id
+                );
+                assert!(
+                    h.explanation.matched_terms.is_empty()
+                        && h.explanation.contributions_sum_exactly(),
+                    "{query:?}: graph hit {} must have an empty, consistent lexical why",
+                    h.id
+                );
+                continue;
+            }
             assert!(
                 !h.explanation.matched_terms.is_empty(),
                 "{query:?}: hit {} has an empty why",

@@ -83,6 +83,19 @@ impl Explanation {
         }
     }
 
+    /// The explanation for a memory surfaced by the link graph (Personalized
+    /// PageRank), not by lexical match: no matched terms, zero BM25 score.
+    /// The "how we reached it" lives on the hit (`graph_via`); this keeps the
+    /// contribution-sum invariant trivially true (0 == 0).
+    pub fn graph_reached(ignored: &[IgnoredTerm]) -> Explanation {
+        Explanation {
+            matched_terms: Vec::new(),
+            ignored_terms: ignored.to_vec(),
+            score_micros: 0,
+            rerank: None,
+        }
+    }
+
     /// The invariant, as a checkable predicate.
     pub fn contributions_sum_exactly(&self) -> bool {
         self.matched_terms
@@ -240,6 +253,11 @@ mod tests {
                 title: "sync".to_string(),
                 tags: vec![],
                 created: 0,
+                links: vec![],
+                harness: None,
+                core: None,
+                rationale: None,
+                scope: None,
                 content_hash: "0".repeat(16),
                 tf,
                 field_len: [1, 0, 5],

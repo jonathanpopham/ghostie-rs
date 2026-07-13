@@ -74,6 +74,18 @@ pub struct Memory {
     pub source: Option<String>,
     /// Id of the decision this one replaces (decision).
     pub supersedes: Option<String>,
+    /// Provenance: which harness created this (`claude-code`, `hermes`,
+    /// `codex`). The WHERE of a cross-provider memory.
+    pub harness: Option<String>,
+    /// Provenance: which model/core produced this (`opus-4.8`,
+    /// `hermes-4-405b`). The WHICH of a cross-provider memory.
+    pub core: Option<String>,
+    /// Why this memory is necessary / when to apply it: the card's why-line,
+    /// surfaced by recall without pulling the full body. The WHY.
+    pub rationale: Option<String>,
+    /// Retrieval scope: `global` (default when absent) or `project:<name>`,
+    /// so project memories do not flood unrelated work.
+    pub scope: Option<String>,
     /// Human-added keys, preserved verbatim in first-seen order.
     pub unknown_keys: Vec<(String, FmValue)>,
     /// The Markdown body.
@@ -156,6 +168,10 @@ impl Memory {
         };
         let source = scalar_field("source");
         let supersedes = scalar_field("supersedes");
+        let harness = scalar_field("harness");
+        let core = scalar_field("core");
+        let rationale = scalar_field("rationale");
+        let scope = scalar_field("scope");
 
         // Type-scoping: warn, never error.
         if supersedes.is_some() && mtype != MemoryType::Decision {
@@ -194,6 +210,10 @@ impl Memory {
                 links,
                 source,
                 supersedes,
+                harness,
+                core,
+                rationale,
+                scope,
                 unknown_keys,
                 body: doc.body.clone(),
             },
@@ -230,6 +250,18 @@ impl Memory {
                 "supersedes".to_string(),
                 FmValue::Scalar(supersedes.clone()),
             ));
+        }
+        if let Some(harness) = &self.harness {
+            pairs.push(("harness".to_string(), FmValue::Scalar(harness.clone())));
+        }
+        if let Some(core) = &self.core {
+            pairs.push(("core".to_string(), FmValue::Scalar(core.clone())));
+        }
+        if let Some(rationale) = &self.rationale {
+            pairs.push(("rationale".to_string(), FmValue::Scalar(rationale.clone())));
+        }
+        if let Some(scope) = &self.scope {
+            pairs.push(("scope".to_string(), FmValue::Scalar(scope.clone())));
         }
         pairs.extend(self.unknown_keys.iter().cloned());
         FrontmatterDoc {
@@ -363,6 +395,10 @@ mod tests {
             links: vec![],
             source: None,
             supersedes: None,
+            harness: None,
+            core: None,
+            rationale: None,
+            scope: None,
             unknown_keys: vec![],
             body: String::new(),
         };

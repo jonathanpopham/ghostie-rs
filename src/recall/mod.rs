@@ -7,23 +7,26 @@
 //!
 //! Pipeline: tokenize query -> corpus stats (index, hash-verified fresh;
 //! a deleted or unusable index is rebuilt from the files, so results are
-//! IDENTICAL with or without it) -> BM25 -> type/tag filters (BEFORE
-//! truncation, so filters don't starve results) -> rerank stage (identity
-//! until the post-milestone hash-embedding bead) -> explanations -> top-k
-//! in the total order (score desc, id asc).
+//! IDENTICAL with or without it) -> BM25 -> seed Personalized PageRank with
+//! those hits and walk the `links` graph, so memories linked to a hit surface
+//! by association (each naming the edge that carried it) -> type/tag/scope
+//! filters (BEFORE truncation, so filters don't starve results) -> total
+//! order (score desc, id asc) -> pack under the token budget -> top-k.
 
 pub mod bm25;
 pub mod explain;
+pub mod ppr;
 pub mod tokenize;
 
 use crate::error::{Result, Warning};
 use crate::json::Value;
-use crate::recall::bm25::{ScoredDoc, bm25_scores};
+use crate::recall::bm25::bm25_scores;
 use crate::recall::explain::{Explanation, ignored_terms};
 use crate::store::Store;
 use crate::store::index::Index;
 use crate::store::memory::MemoryType;
 use crate::util::format_rfc3339_utc;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Options for [`recall`].
 #[derive(Debug, Clone)]
@@ -37,6 +40,13 @@ pub struct RecallOpts {
     /// Score floor in micro-units; 0 = no cutoff (default; revisit after
     /// dogfooding).
     pub min_score_micros: i64,
+    /// Only memories in this scope (`global` or `project:<name>`). A memory
+    /// with no scope is treated as `global` and always eligible.
+    pub scope: Option<String>,
+    /// Approximate token budget for the whole result: recall packs the
+    /// highest-value cards greedily until the budget is spent, so the caller
+    /// (a hook injecting context) never floods. `None` = only `k` bounds it.
+    pub budget_tokens: Option<usize>,
 }
 
 impl Default for RecallOpts {
@@ -46,6 +56,8 @@ impl Default for RecallOpts {
             mtype: None,
             tag: None,
             min_score_micros: 0,
+            scope: None,
+            budget_tokens: None,
         }
     }
 }
@@ -63,8 +75,21 @@ pub struct RecallHit {
     pub created: i64,
     /// Path relative to the store root (agents open the file directly).
     pub path: String,
-    /// BM25 score, micro-units.
+    /// The blended ranking score, micro-units: BM25 for a lexical hit, the
+    /// Personalized-PageRank mass for a graph-reached hit.
     pub score_micros: i64,
+    /// Graph-reach mass (micro-units), > 0 only when the memory surfaced via
+    /// the link graph rather than a lexical match.
+    pub graph_micros: i64,
+    /// For a graph-reached hit, the seed memory on the other end of the edge:
+    /// "reached via link from `<graph_via>`". `None` for lexical hits.
+    pub graph_via: Option<String>,
+    /// Provenance: the why-line, surfaced on the card without the body.
+    pub rationale: Option<String>,
+    /// Provenance: harness that created it (the WHERE, cross-provider).
+    pub harness: Option<String>,
+    /// Provenance: model/core that produced it (the WHICH, cross-provider).
+    pub core: Option<String>,
     /// The why.
     pub explanation: Explanation,
 }
@@ -81,8 +106,14 @@ pub struct RecallResult {
 }
 
 impl RecallHit {
-    /// Robot rendering, fixed key order, byte-stable.
+    /// Robot rendering, fixed key order, byte-stable. Provenance and
+    /// graph-reach keys are always present (null/0 when absent) so the schema
+    /// is stable for the hooks that consume it.
     pub fn to_json(&self) -> Value {
+        let opt = |s: &Option<String>| match s {
+            Some(v) => Value::string(v.clone()),
+            None => Value::Null,
+        };
         Value::Object(vec![
             ("id".to_string(), Value::string(self.id.clone())),
             ("type".to_string(), Value::string(self.mtype.as_str())),
@@ -93,9 +124,46 @@ impl RecallHit {
             ),
             ("path".to_string(), Value::string(self.path.clone())),
             ("score_micros".to_string(), Value::int(self.score_micros)),
+            ("graph_micros".to_string(), Value::int(self.graph_micros)),
+            ("graph_via".to_string(), opt(&self.graph_via)),
+            ("rationale".to_string(), opt(&self.rationale)),
+            ("harness".to_string(), opt(&self.harness)),
+            ("core".to_string(), opt(&self.core)),
             ("why".to_string(), self.explanation.to_json()),
         ])
     }
+
+    /// The compact one-line "why is this here" for human mode: the lexical
+    /// why for a match, or the edge that carried a graph-reached hit.
+    pub fn why_line(&self) -> String {
+        if let Some(via) = &self.graph_via {
+            return format!(
+                "why: reached via link from {} (graph {})",
+                via,
+                render_micros(self.graph_micros)
+            );
+        }
+        self.explanation.render_human()
+    }
+
+    /// The provenance tag for the card, e.g. ` [hermes/hermes-4-405b]`, or
+    /// empty when the memory carries no provenance.
+    pub fn provenance_tag(&self) -> String {
+        match (&self.harness, &self.core) {
+            (Some(h), Some(c)) => format!(" [{h}/{c}]"),
+            (Some(h), None) => format!(" [{h}]"),
+            (None, Some(c)) => format!(" [{c}]"),
+            (None, None) => String::new(),
+        }
+    }
+}
+
+/// Render micro-units as a fixed 2-decimal string without floats (the gate
+/// bans floats in recall): `240000` -> `0.24`.
+fn render_micros(micros: i64) -> String {
+    let whole = micros / ppr::SCALE;
+    let frac = (micros % ppr::SCALE).abs() / (ppr::SCALE / 100); // hundredths
+    format!("{whole}.{frac:02}")
 }
 
 impl RecallResult {
@@ -125,14 +193,45 @@ impl RecallResult {
     }
 }
 
-/// The rerank slot: identity until the post-milestone hash-embedding
-/// rerank bead fills it. The pipeline shape will not change — only this
-/// stage.
-fn rerank_stage(hits: Vec<ScoredDoc>) -> Vec<ScoredDoc> {
-    hits
+/// Estimate the context cost of one card in tokens (~4 chars/token), so the
+/// budget packer can bound how much recall injects. Title plus the surfaced
+/// why-line (rationale), plus a small fixed overhead for the id/score line.
+fn card_token_cost(hit: &RecallHit) -> usize {
+    let chars = hit.title.chars().count()
+        + hit.rationale.as_deref().map(str::len).unwrap_or(0)
+        + hit.id.len();
+    chars / 4 + 8
+}
+
+/// Does this memory pass the mtype/tag/scope filters? Applied while
+/// assembling, so filters never starve a later result. A memory with no
+/// scope is `global` and passes any scope filter.
+fn passes_filters(entry: &crate::store::index::DocEntry, opts: &RecallOpts) -> bool {
+    if let Some(t) = opts.mtype
+        && entry.mtype != t
+    {
+        return false;
+    }
+    if let Some(tag) = &opts.tag
+        && !entry.tags.iter().any(|x| x == tag)
+    {
+        return false;
+    }
+    if let Some(scope) = &opts.scope {
+        let entry_scope = entry.scope.as_deref().unwrap_or("global");
+        if entry_scope != scope {
+            return false;
+        }
+    }
+    true
 }
 
 /// The library-level entry point the CLI fronts.
+///
+/// Pipeline: BM25 lexical scores -> seed Personalized PageRank with them ->
+/// surface both the lexical hits and their linked neighbours (reached "by
+/// association", each naming the edge that carried it) -> filter -> rank in
+/// a total order (score desc, id asc) -> pack under the token budget -> k.
 ///
 /// Empty query, empty store and zero hits all return cleanly with empty
 /// hits (and a warning where helpful) — never an error, never a panic.
@@ -145,28 +244,32 @@ pub fn recall(store: &Store, query: &str, opts: &RecallOpts) -> Result<RecallRes
             message: "query contains only stopwords/punctuation; nothing to match".to_string(),
         });
     }
-    let scored = rerank_stage(bm25_scores(&query_terms, &index));
+    let scored = bm25_scores(&query_terms, &index);
     let ignored = ignored_terms(query, &index);
-    let mut hits = Vec::new();
-    for s in scored {
+
+    // Seed PPR with the lexical hits (id -> BM25 micros), then walk the links.
+    let mut seeds: BTreeMap<String, i64> = BTreeMap::new();
+    for s in &scored {
+        if s.score_micros > 0 {
+            seeds.insert(s.id.clone(), s.score_micros);
+        }
+    }
+    let ppr_mass = ppr::personalized_pagerank(&index, &seeds);
+    let direct: BTreeSet<&str> = scored.iter().map(|s| s.id.as_str()).collect();
+
+    let mut hits: Vec<RecallHit> = Vec::new();
+
+    // 1. Lexical hits, scored and explained by BM25 exactly as before.
+    for s in &scored {
         let Some(entry) = index.docs.get(&s.id) else {
             continue; // unreachable: scorer only sees indexed docs
         };
-        // Filter BEFORE truncating to k, so filters don't starve results.
-        if let Some(t) = opts.mtype
-            && entry.mtype != t
-        {
-            continue;
-        }
-        if let Some(tag) = &opts.tag
-            && !entry.tags.iter().any(|x| x == tag)
-        {
+        if !passes_filters(entry, opts) {
             continue;
         }
         if opts.min_score_micros > 0 && s.score_micros < opts.min_score_micros {
             continue;
         }
-        let explanation = Explanation::for_hit(&s, &ignored);
         hits.push(RecallHit {
             id: s.id.clone(),
             mtype: entry.mtype,
@@ -174,13 +277,80 @@ pub fn recall(store: &Store, query: &str, opts: &RecallOpts) -> Result<RecallRes
             created: entry.created,
             path: entry.path.clone(),
             score_micros: s.score_micros,
-            explanation,
+            graph_micros: 0,
+            graph_via: None,
+            rationale: entry.rationale.clone(),
+            harness: entry.harness.clone(),
+            core: entry.core.clone(),
+            explanation: Explanation::for_hit(s, &ignored),
         });
-        if hits.len() == opts.k {
+    }
+
+    // 2. Graph-reached hits: memories linked to a seed that did not match
+    //    lexically. Bounded to those with a direct seed neighbour (1-hop, so
+    //    the "reached via link from X" edge is real and nameable) and above
+    //    the mass floor (so faint echoes do not flood).
+    for (id, mass) in &ppr_mass {
+        if direct.contains(id.as_str()) || *mass < ppr::GRAPH_FLOOR {
+            continue;
+        }
+        let Some(entry) = index.docs.get(id) else {
+            continue;
+        };
+        if !passes_filters(entry, opts) {
+            continue;
+        }
+        if opts.min_score_micros > 0 && *mass < opts.min_score_micros {
+            continue;
+        }
+        let Some(via) = ppr::strongest_seed_neighbor(&index, id, &seeds) else {
+            continue;
+        };
+        hits.push(RecallHit {
+            id: id.clone(),
+            mtype: entry.mtype,
+            title: entry.title.clone(),
+            created: entry.created,
+            path: entry.path.clone(),
+            score_micros: *mass,
+            graph_micros: *mass,
+            graph_via: Some(via),
+            rationale: entry.rationale.clone(),
+            harness: entry.harness.clone(),
+            core: entry.core.clone(),
+            explanation: Explanation::graph_reached(&ignored),
+        });
+    }
+
+    // Total order: score desc, id asc (stable, deterministic).
+    hits.sort_by(|a, b| {
+        b.score_micros
+            .cmp(&a.score_micros)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    // Pack under k and (optionally) the token budget.
+    let mut out = Vec::new();
+    let mut spent = 0usize;
+    for hit in hits {
+        if out.len() == opts.k {
             break;
         }
+        if let Some(budget) = opts.budget_tokens {
+            let cost = card_token_cost(&hit);
+            // Always admit the first card even if it alone exceeds budget, so
+            // a tight budget still answers rather than returning nothing.
+            if !out.is_empty() && spent + cost > budget {
+                continue;
+            }
+            spent += cost;
+        }
+        out.push(hit);
     }
-    Ok(RecallResult { hits, warnings })
+    Ok(RecallResult {
+        hits: out,
+        warnings,
+    })
 }
 
 #[cfg(test)]

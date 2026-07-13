@@ -23,7 +23,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Bump when the on-disk index schema changes (old indexes are rebuilt).
-pub const FORMAT_VERSION: i64 = 1;
+/// v2 adds `links` (the recall graph edges, for Personalized PageRank) and
+/// provenance (`harness`/`core`/`rationale`/`scope`) so recall renders cards
+/// without re-reading files.
+pub const FORMAT_VERSION: i64 = 2;
 
 /// The three scored fields, in canonical order. Array positions in
 /// [`DocEntry::tf`] and [`DocEntry::field_len`] follow this order.
@@ -44,6 +47,17 @@ pub struct DocEntry {
     pub tags: Vec<String>,
     /// Created, epoch seconds.
     pub created: i64,
+    /// Ids of linked memories: the edges of the recall graph, walked by
+    /// Personalized PageRank to reach memories relevant by association.
+    pub links: Vec<String>,
+    /// Provenance: harness that created it (`claude-code`, `hermes`).
+    pub harness: Option<String>,
+    /// Provenance: model/core that produced it (`opus-4.8`).
+    pub core: Option<String>,
+    /// The why-line, surfaced on the recall card without re-reading the file.
+    pub rationale: Option<String>,
+    /// Retrieval scope (`global` | `project:<name>`).
+    pub scope: Option<String>,
     /// FNV-1a 64 hex of the file bytes at index time.
     pub content_hash: String,
     /// term -> tf per field `[title, tags, body]`.
@@ -82,6 +96,11 @@ impl Index {
             title: memory.title.clone(),
             tags: memory.tags.clone(),
             created: memory.created,
+            links: memory.links.clone(),
+            harness: memory.harness.clone(),
+            core: memory.core.clone(),
+            rationale: memory.rationale.clone(),
+            scope: memory.scope.clone(),
             content_hash: fnv1a64_hex(file_bytes),
             tf,
             field_len: [
@@ -215,7 +234,7 @@ impl Index {
                     )
                 })
                 .collect();
-            let entry = Value::sorted_object(vec![
+            let mut entry_pairs = vec![
                 ("path".to_string(), Value::string(e.path.clone())),
                 ("type".to_string(), Value::string(e.mtype.as_str())),
                 ("title".to_string(), Value::string(e.title.clone())),
@@ -232,8 +251,26 @@ impl Index {
                     Value::string(e.content_hash.clone()),
                 ),
                 ("fields".to_string(), Value::sorted_object(fields_obj)),
-            ]);
-            memories.push((id.clone(), entry));
+            ];
+            // links + provenance: omitted when empty/None (no noise in the
+            // common case); sorted_object places them by key on emit.
+            if !e.links.is_empty() {
+                entry_pairs.push((
+                    "links".to_string(),
+                    Value::Array(e.links.iter().map(Value::string).collect()),
+                ));
+            }
+            for (key, val) in [
+                ("harness", &e.harness),
+                ("core", &e.core),
+                ("rationale", &e.rationale),
+                ("scope", &e.scope),
+            ] {
+                if let Some(v) = val {
+                    entry_pairs.push((key.to_string(), Value::string(v.clone())));
+                }
+            }
+            memories.push((id.clone(), Value::sorted_object(entry_pairs)));
         }
         let df_pairs: Vec<(String, Value)> = self
             .df()
@@ -363,6 +400,20 @@ impl Index {
                     }
                 }
             }
+            let links = entry
+                .get("links")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let opt_str = |key: &str| -> Option<String> {
+                entry.get(key).and_then(Value::as_str).map(str::to_string)
+            };
             docs.insert(
                 id.clone(),
                 DocEntry {
@@ -372,6 +423,11 @@ impl Index {
                     title: str_field("title")?,
                     tags,
                     created,
+                    links,
+                    harness: opt_str("harness"),
+                    core: opt_str("core"),
+                    rationale: opt_str("rationale"),
+                    scope: opt_str("scope"),
                     content_hash: str_field("content_hash")?,
                     tf,
                     field_len,

@@ -287,25 +287,39 @@ ghostie remember --type fact|decision|rule \"title\" [options]
   --tags a,b       comma-separated tags
   --link <id>      link to a memory id (repeatable)
   --supersedes <id> (decisions) the decision this one replaces
+  --why <text>     why this is necessary; the card's why-line (alias --rationale)
+  --harness <h>    provenance: where it was made (claude-code | hermes | codex)
+  --core <m>       provenance: which model produced it (opus-4.8 | hermes-4-405b)
+  --scope <s>      global (default) | project:<name>, to keep recall focused
 
 EXAMPLES
   ghostie remember --type rule \"Always run verify.sh before commit\" --tags ci
+  ghostie remember --type decision \"Chose Postgres over Mongo\" \\
+    --why \"we'll hit this again porting the API\" --harness hermes --core hermes-4-405b
   echo \"body text\" | ghostie remember --type fact \"Configs live in etc\" --body - --json
 
 EXIT CODES: 0 created · 1 store failure · 2 bad arguments
 ";
 
 const HELP_RECALL: &str = "\
-ghostie recall \"<task or question>\" [-k N] [--type t] [--tag t] [--json]
+ghostie recall \"<task or question>\" [-k N] [--type t] [--tag t]
+                                    [--scope s] [--budget N] [--json]
 
   The query is ONE positional argument — quote multi-word queries.
   -k <N>        max hits (default 10)
   --type <t>    only memories of this type
   --tag <t>     only memories carrying this tag
+  --scope <s>   only this scope (global | project:<name>)
+  --budget <N>  cap the result at ~N tokens; packs the best cards and stops,
+                so a context-injection hook never floods (top card always kept)
+
+  Hits reached through the link graph (Personalized PageRank) rather than by
+  word match are labelled \"reached via link from <id>\".
 
 EXAMPLES
   ghostie recall \"which branch do we sync to\"
   ghostie recall \"tokenizer bug\" -k 3 --json
+  ghostie recall \"auth approach\" --budget 800   # for a session-start hook
 
 EXIT CODES: 0 (zero hits is an answer, not an error) · 1 failure · 2 bad arguments
 ";
@@ -415,6 +429,10 @@ fn cmd_remember(
     let mut tags: Vec<String> = Vec::new();
     let mut links: Vec<String> = Vec::new();
     let mut supersedes: Option<String> = None;
+    let mut harness: Option<String> = None;
+    let mut core: Option<String> = None;
+    let mut rationale: Option<String> = None;
+    let mut scope: Option<String> = None;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -490,6 +508,46 @@ fn cmd_remember(
                     .ok_or_else(|| usage("--supersedes requires a memory id".to_string()))?;
                 supersedes = Some(v.clone());
             }
+            "--harness" => {
+                i += 1;
+                harness = Some(
+                    rest.get(i)
+                        .ok_or_else(|| {
+                            usage("--harness requires a value (e.g. claude-code)".to_string())
+                        })?
+                        .clone(),
+                );
+            }
+            "--core" => {
+                i += 1;
+                core = Some(
+                    rest.get(i)
+                        .ok_or_else(|| {
+                            usage("--core requires a value (e.g. opus-4.8)".to_string())
+                        })?
+                        .clone(),
+                );
+            }
+            // `--why` is the ergonomic alias for `--rationale`: the reason
+            // this memory is necessary, surfaced on the recall card.
+            "--rationale" | "--why" => {
+                i += 1;
+                rationale = Some(
+                    rest.get(i)
+                        .ok_or_else(|| usage("--why requires text".to_string()))?
+                        .clone(),
+                );
+            }
+            "--scope" => {
+                i += 1;
+                scope = Some(
+                    rest.get(i)
+                        .ok_or_else(|| {
+                            usage("--scope requires a value (global | project:<name>)".to_string())
+                        })?
+                        .clone(),
+                );
+            }
             a if a.starts_with('-') => {
                 return Err(usage(format!("unknown flag '{a}' for remember")));
             }
@@ -520,6 +578,10 @@ fn cmd_remember(
             links,
             source: None,
             supersedes,
+            harness,
+            core,
+            rationale,
+            scope,
             body,
         },
         clock.as_ref(),
@@ -594,6 +656,22 @@ fn cmd_recall(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk,
                     .ok_or_else(|| usage("--tag requires a value".to_string()))?;
                 opts.tag = Some(v.clone());
             }
+            "--scope" => {
+                i += 1;
+                let v = rest.get(i).ok_or_else(|| {
+                    usage("--scope requires a value (global | project:<name>)".to_string())
+                })?;
+                opts.scope = Some(v.clone());
+            }
+            "--budget" => {
+                i += 1;
+                let v = rest
+                    .get(i)
+                    .ok_or_else(|| usage("--budget requires a token count".to_string()))?;
+                opts.budget_tokens = Some(v.parse::<usize>().map_err(|_| {
+                    usage(format!("--budget expects a positive integer, got '{v}'"))
+                })?);
+            }
             a if a.starts_with('-') => {
                 return Err(usage(format!("unknown flag '{a}' for recall")));
             }
@@ -618,14 +696,20 @@ fn cmd_recall(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk,
     }
     for (rank, hit) in result.hits.iter().enumerate() {
         human.push_str(&format!(
-            "{:>2}. {}  [{}]  score {}\n    {}\n    {}\n",
+            "{:>2}. {}  [{}]  score {}{}\n    {}\n",
             rank + 1,
             hit.id,
             hit.mtype.as_str(),
             render_score(hit.score_micros),
+            hit.provenance_tag(),
             hit.title,
-            hit.explanation.render_human(),
         ));
+        // The card's why-line (rationale) when present — the reason this
+        // memory matters, surfaced without pulling the body.
+        if let Some(rationale) = &hit.rationale {
+            human.push_str(&format!("    ↳ {rationale}\n"));
+        }
+        human.push_str(&format!("    {}\n", hit.why_line()));
     }
     Ok(CmdOk {
         data: result.to_json(),
