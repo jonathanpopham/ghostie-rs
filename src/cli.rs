@@ -26,6 +26,7 @@ use crate::recall::{RecallOpts, recall};
 use crate::store::memory::MemoryType;
 use crate::store::{ListFilter, NewMemory, Store};
 use crate::util::{format_rfc3339_utc, resolve_clock};
+use crate::{capture, hook, sync};
 use std::path::PathBuf;
 
 /// Subcommands implemented so far, in help order. The robot audit and the
@@ -78,14 +79,11 @@ pub fn execute(args: &[String], stdin_body: Option<&str>) -> CliOutput {
         "recall" => wrap(command, &parsed, |store| cmd_recall(store, rest, json_mode)),
         "list" => wrap(command, &parsed, |store| cmd_list(store, rest, json_mode)),
         "_recanon" => wrap(command, &parsed, cmd_recanon),
-        "capture" | "sync" => {
-            let e = Error::Usage {
-                message: format!(
-                    "'{command}' is not implemented yet (post-milestone; see docs/GOAL.md)"
-                ),
-            };
-            render_failure(command, json_mode, &e, Vec::new())
-        }
+        "capture" => wrap(command, &parsed, |store| {
+            cmd_capture(store, rest, json_mode)
+        }),
+        "sync" => wrap(command, &parsed, |store| cmd_sync(store, rest, json_mode)),
+        "hook" => wrap(command, &parsed, |store| cmd_hook(store, rest, json_mode)),
         other => {
             let e = Error::Usage {
                 message: format!("unknown command '{other}'; try `ghostie help`"),
@@ -144,6 +142,7 @@ fn render_failure(command: &str, json_mode: bool, e: &Error, warnings: Vec<Warni
     let mut out = CliOutput {
         exit_code: match e {
             Error::Usage { .. } => 2,
+            Error::Conflict { .. } => 3,
             _ => 1,
         },
         ..CliOutput::default()
@@ -155,6 +154,7 @@ fn render_failure(command: &str, json_mode: bool, e: &Error, warnings: Vec<Warni
             Error::Parse { .. } => "parse",
             Error::Invalid { .. } => "invalid",
             Error::InvalidTimestamp { .. } => "timestamp",
+            Error::Conflict { .. } => "conflict",
         };
         let envelope = Value::Object(vec![
             ("ok".to_string(), Value::Bool(false)),
@@ -264,10 +264,16 @@ COMMANDS
   remember   create a memory from the command line
   recall     query the store; ranked hits, each with a why
   list       enumerate memories deterministically
-  capture    (post-milestone) ingest a session log
-  sync       (post-milestone) sync via your own git remote
+  capture    distill a session log into memories
+  sync       sync the store via your own git remote (--init <remote> first)
+  hook       auto-recall / auto-capture: `hook install`, `status`, `uninstall`
   help       this text; `ghostie help <command>` for details
   version    print the version
+
+THE TWO BUTTONS (make it just work)
+  ghostie sync --init <your-git-remote>   # 1. wire your own remote
+  ghostie hook install --sync             # 2. auto-recall on prompts,
+                                          #    auto-capture + push on session end
 
 GLOBAL FLAGS
   --json           robot mode: exactly one JSON document on stdout
@@ -275,7 +281,7 @@ GLOBAL FLAGS
   --quiet          suppress human-mode warnings
 
 EXIT CODES
-  0 success · 1 operational failure · 2 usage error · 3 sync conflicts (reserved)
+  0 success · 1 operational failure · 2 usage error · 3 sync conflicts
 ";
 
 const HELP_REMEMBER: &str = "\
@@ -340,11 +346,55 @@ EXAMPLES
 EXIT CODES: 0 success · 1 failure · 2 bad arguments
 ";
 
+const HELP_CAPTURE: &str = "\
+ghostie capture <transcript-path> [--harness h] [--core c]
+
+  Distill an agent session log (Claude Code JSONL) into memories: a
+  session-summary carrying provenance, plus one memory for each
+  `MEMORY <type>: text` marker left in the transcript.
+  --harness <h>   override the recorded harness (claude-code | hermes | ...)
+  --core <c>      override the recorded model
+
+EXIT CODES: 0 success · 1 failure · 2 bad arguments
+";
+
+const HELP_SYNC: &str = "\
+ghostie sync [--init <git-remote>]
+
+  --init <remote>   one-time: make the store a git repo pointed at your own
+                    remote (the derived index is never synced)
+  (no args)         commit local changes, rebase in remote changes, push
+
+  Conflicts are reported, never auto-resolved (exit code 3): the working tree
+  is left untouched for you to resolve, then re-run.
+
+EXIT CODES: 0 success · 1 failure · 2 bad arguments · 3 sync conflict
+";
+
+const HELP_HOOK: &str = "\
+ghostie hook <subcommand>
+
+  install [--budget N] [--sync]   wire Claude Code to recall relevant memories
+                                  on each prompt and capture (and optionally
+                                  push) on session end; backs up settings first
+  status                          show whether the hooks are installed
+  uninstall                       remove ghostie's hooks, leave the rest
+  run recall [--budget N]         runner: reads the hook payload on stdin,
+                                  emits injectable context (invoked by install)
+  run capture [--sync]            runner: captures the transcript named in the
+                                  payload, optionally syncs
+
+EXIT CODES: 0 success · 1 failure · 2 bad arguments
+";
+
 fn help(rest: &[String], json_mode: bool) -> CliOutput {
     let text = match rest.first().map(String::as_str) {
         Some("remember") => HELP_REMEMBER,
         Some("recall") => HELP_RECALL,
         Some("list") => HELP_LIST,
+        Some("capture") => HELP_CAPTURE,
+        Some("sync") => HELP_SYNC,
+        Some("hook") => HELP_HOOK,
         _ => HELP,
     };
     let mut out = CliOutput::default();
@@ -859,6 +909,269 @@ fn cmd_recanon(store: &Store) -> Result<CmdOk, Error> {
         human: format!("rewrote {} memories in canonical form\n", memories.len()),
         warnings,
     })
+}
+
+/// `capture <transcript> [--harness h] [--core c]`: distill a session log into
+/// memories (a session-summary plus any `MEMORY <type>:` markers).
+fn cmd_capture(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, Error> {
+    let usage = |message: String| Error::Usage { message };
+    let mut path: Option<String> = None;
+    let mut harness: Option<String> = None;
+    let mut core: Option<String> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--harness" => {
+                i += 1;
+                harness = Some(
+                    rest.get(i)
+                        .ok_or_else(|| usage("--harness requires a value".to_string()))?
+                        .clone(),
+                );
+            }
+            "--core" => {
+                i += 1;
+                core = Some(
+                    rest.get(i)
+                        .ok_or_else(|| usage("--core requires a value".to_string()))?
+                        .clone(),
+                );
+            }
+            a if a.starts_with('-') => {
+                return Err(usage(format!("unknown flag '{a}' for capture")));
+            }
+            positional => {
+                if path.is_some() {
+                    return Err(usage("capture takes one transcript path".to_string()));
+                }
+                path = Some(positional.to_string());
+            }
+        }
+        i += 1;
+    }
+    let path = path.ok_or_else(|| usage("capture requires a transcript path".to_string()))?;
+    let clock = resolve_clock()?;
+    let created = capture::capture_file(
+        store,
+        &path,
+        harness.as_deref(),
+        core.as_deref(),
+        clock.as_ref(),
+    )?;
+    let items: Vec<Value> = created
+        .iter()
+        .map(|m| {
+            Value::Object(vec![
+                ("id".to_string(), Value::string(m.id.clone())),
+                ("type".to_string(), Value::string(m.mtype.as_str())),
+                ("title".to_string(), Value::string(m.title.clone())),
+            ])
+        })
+        .collect();
+    let mut human = format!("captured {} memory(ies):\n", created.len());
+    for m in &created {
+        human.push_str(&format!(
+            "  {}  [{}]  {}\n",
+            m.id,
+            m.mtype.as_str(),
+            m.title
+        ));
+    }
+    Ok(CmdOk {
+        data: Value::Object(vec![("created".to_string(), Value::Array(items))]),
+        human,
+        warnings: Vec::new(),
+    })
+}
+
+/// `sync --init <remote>` wires the store to your own git remote; `sync`
+/// commits, rebases in remote changes, and pushes.
+fn cmd_sync(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, Error> {
+    let usage = |message: String| Error::Usage { message };
+    let mut init: Option<String> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--init" => {
+                i += 1;
+                init = Some(
+                    rest.get(i)
+                        .ok_or_else(|| usage("--init requires a git remote URL".to_string()))?
+                        .clone(),
+                );
+            }
+            a => return Err(usage(format!("unknown argument '{a}' for sync"))),
+        }
+        i += 1;
+    }
+    if let Some(remote) = init {
+        sync::sync_init(store, &remote)?;
+        return Ok(CmdOk {
+            data: Value::Object(vec![
+                ("initialized".to_string(), Value::Bool(true)),
+                ("remote".to_string(), Value::string(remote.clone())),
+            ]),
+            human: format!("sync initialized against {remote}\n"),
+            warnings: Vec::new(),
+        });
+    }
+    let clock = resolve_clock()?;
+    let out = sync::sync(store, clock.as_ref())?;
+    Ok(CmdOk {
+        data: Value::Object(vec![
+            ("committed".to_string(), Value::Bool(out.committed)),
+            ("pulled".to_string(), Value::Bool(out.pulled)),
+            ("pushed".to_string(), Value::Bool(out.pushed)),
+            ("branch".to_string(), Value::string(out.branch.clone())),
+        ]),
+        human: format!(
+            "sync ok (branch {}): {}{}pushed\n",
+            out.branch,
+            if out.committed { "committed, " } else { "" },
+            if out.pulled { "pulled, " } else { "" },
+        ),
+        warnings: Vec::new(),
+    })
+}
+
+/// `hook run recall|capture` are the harness-invoked runners (payload on
+/// stdin); `hook install|status|uninstall` manage the Claude Code settings.
+fn cmd_hook(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, Error> {
+    let usage = |message: String| Error::Usage { message };
+    let sub = rest.first().map(String::as_str).ok_or_else(|| {
+        usage("hook needs a subcommand: run | install | status | uninstall".to_string())
+    })?;
+    match sub {
+        "run" => {
+            let which = rest
+                .get(1)
+                .map(String::as_str)
+                .ok_or_else(|| usage("hook run needs: recall | capture".to_string()))?;
+            // The runners read the harness payload from stdin.
+            let mut stdin = String::new();
+            use std::io::Read;
+            std::io::stdin()
+                .read_to_string(&mut stdin)
+                .map_err(|e| Error::Io {
+                    context: "reading hook payload from stdin".to_string(),
+                    path: "<stdin>".to_string(),
+                    source: e,
+                })?;
+            match which {
+                "recall" => {
+                    let mut budget = hook::DEFAULT_BUDGET;
+                    let mut j = 2;
+                    while j < rest.len() {
+                        if rest[j] == "--budget" {
+                            j += 1;
+                            budget = rest
+                                .get(j)
+                                .and_then(|v| v.parse::<usize>().ok())
+                                .ok_or_else(|| usage("--budget requires a number".to_string()))?;
+                        }
+                        j += 1;
+                    }
+                    let out = hook::run_recall(store, &stdin, budget)?;
+                    Ok(CmdOk {
+                        data: Value::Object(vec![(
+                            "emitted".to_string(),
+                            Value::Bool(!out.is_empty()),
+                        )]),
+                        human: out,
+                        warnings: Vec::new(),
+                    })
+                }
+                "capture" => {
+                    let do_sync = rest.iter().any(|a| a == "--sync");
+                    let clock = resolve_clock()?;
+                    let msg = hook::run_capture(store, &stdin, do_sync, clock.as_ref())?;
+                    Ok(CmdOk {
+                        data: Value::Object(vec![(
+                            "status".to_string(),
+                            Value::string(msg.clone()),
+                        )]),
+                        human: format!("{msg}\n"),
+                        warnings: Vec::new(),
+                    })
+                }
+                other => Err(usage(format!("unknown hook runner '{other}'"))),
+            }
+        }
+        "install" => {
+            let mut budget = hook::DEFAULT_BUDGET;
+            let mut do_sync = false;
+            let mut i = 1;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--budget" => {
+                        i += 1;
+                        budget = rest
+                            .get(i)
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .ok_or_else(|| usage("--budget requires a number".to_string()))?;
+                    }
+                    "--sync" => do_sync = true,
+                    a => return Err(usage(format!("unknown flag '{a}' for hook install"))),
+                }
+                i += 1;
+            }
+            let settings = hook::claude_settings_path()?;
+            let rep = hook::install_at(&settings, store.root(), budget, do_sync)?;
+            Ok(CmdOk {
+                data: Value::Object(vec![
+                    (
+                        "settings".to_string(),
+                        Value::string(rep.path.display().to_string()),
+                    ),
+                    ("backed_up".to_string(), Value::Bool(rep.backed_up)),
+                ]),
+                human: format!(
+                    "installed recall + capture hooks in {}{}\nrestart Claude Code (or open a new session) to activate\n",
+                    rep.path.display(),
+                    if rep.backed_up {
+                        " (backup written)"
+                    } else {
+                        ""
+                    },
+                ),
+                warnings: Vec::new(),
+            })
+        }
+        "status" => {
+            let settings = hook::claude_settings_path()?;
+            let (recall_on, capture_on) = hook::status_at(&settings)?;
+            Ok(CmdOk {
+                data: Value::Object(vec![
+                    ("recall".to_string(), Value::Bool(recall_on)),
+                    ("capture".to_string(), Value::Bool(capture_on)),
+                ]),
+                human: format!(
+                    "recall-on-prompt: {}\ncapture-on-end:   {}\n",
+                    if recall_on {
+                        "installed"
+                    } else {
+                        "not installed"
+                    },
+                    if capture_on {
+                        "installed"
+                    } else {
+                        "not installed"
+                    },
+                ),
+                warnings: Vec::new(),
+            })
+        }
+        "uninstall" => {
+            let settings = hook::claude_settings_path()?;
+            let removed = hook::uninstall_at(&settings)?;
+            Ok(CmdOk {
+                data: Value::Object(vec![("removed".to_string(), Value::int(removed as i64))]),
+                human: format!("removed {removed} ghostie hook entr(ies)\n"),
+                warnings: Vec::new(),
+            })
+        }
+        other => Err(usage(format!("unknown hook subcommand '{other}'"))),
+    }
 }
 
 #[cfg(test)]

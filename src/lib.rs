@@ -15,6 +15,7 @@
 pub mod capture;
 pub mod cli;
 mod error;
+pub mod hook;
 pub mod json;
 pub mod recall;
 pub mod store;

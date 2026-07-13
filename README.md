@@ -44,10 +44,33 @@ ghostie recall "why did we pick duckdb" --budget 800
 
 Retrieval is literal-token today (no stemming or embeddings): near-miss wording
 can miss, which the link graph and a future hash-embedding rerank are meant to
-cover. Capture-on-a-hook and automatic git sync are the next milestone.
+cover.
 
-Status: the store, provenance, and graph-aware recall are working and gated.
-See `docs/GOAL.md` for the plan and the beads for tracked work.
+## Two buttons, and it just works
+
+The point of provider-agnostic memory is that it moves with you. Two commands
+wire that up:
+
+```sh
+ghostie sync --init <your-git-remote>   # 1. your own remote (any git host)
+ghostie hook install --sync             # 2. auto-recall + auto-capture
+```
+
+After that, in Claude Code: relevant memories are recalled and injected on each
+prompt (bounded by a token budget), and when a session ends the transcript is
+captured into memories, then committed and pushed to your remote. Sit down at
+another machine, `ghostie sync --init` the same remote, and your context is
+there. `ghostie hook status` shows what is wired; `ghostie hook uninstall`
+removes it, leaving your other settings untouched.
+
+`ghostie capture <transcript>` distills a session by hand: a session-summary
+carrying provenance plus one memory per `MEMORY <type>: ...` marker left in the
+transcript. Sync shells to the system `git` binary (a tool, not a crate), so
+crate-level zero-dependency holds; conflicts are reported, never auto-resolved.
+
+Status: the store, provenance, graph-aware recall, capture, sync, and the hook
+installer are working and gated. Richer model-driven distillation is the one
+deliberately impure, feature-gated step still ahead. See `docs/GOAL.md`.
 
 ## CI
 

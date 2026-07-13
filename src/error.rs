@@ -49,6 +49,12 @@ pub enum Error {
         /// What was wrong with the invocation.
         message: String,
     },
+    /// A sync conflict the user must resolve by hand (maps to exit code 3).
+    /// ghostie detects and reports conflicts; it never auto-resolves them.
+    Conflict {
+        /// What conflicted and how to resolve it.
+        message: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -80,6 +86,7 @@ impl fmt::Display for Error {
             }
             Error::Invalid { origin, message } => write!(f, "{origin}: {message}"),
             Error::Usage { message } => write!(f, "usage error: {message}"),
+            Error::Conflict { message } => write!(f, "sync conflict: {message}"),
         }
     }
 }
