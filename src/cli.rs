@@ -312,6 +312,7 @@ ghostie recall \"<task or question>\" [-k N] [--type t] [--tag t]
   --scope <s>   only this scope (global | project:<name>)
   --budget <N>  cap the result at ~N tokens; packs the best cards and stops,
                 so a context-injection hook never floods (top card always kept)
+  --diverse     demote near-duplicate memories (MMR); pairs well with --budget
 
   Hits reached through the link graph (Personalized PageRank) rather than by
   word match are labelled \"reached via link from <id>\".
@@ -671,6 +672,9 @@ fn cmd_recall(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk,
                 opts.budget_tokens = Some(v.parse::<usize>().map_err(|_| {
                     usage(format!("--budget expects a positive integer, got '{v}'"))
                 })?);
+            }
+            "--diverse" => {
+                opts.diversify = true;
             }
             a if a.starts_with('-') => {
                 return Err(usage(format!("unknown flag '{a}' for recall")));

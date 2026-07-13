@@ -47,6 +47,11 @@ pub struct RecallOpts {
     /// highest-value cards greedily until the budget is spent, so the caller
     /// (a hook injecting context) never floods. `None` = only `k` bounds it.
     pub budget_tokens: Option<usize>,
+    /// Diversify with Maximal Marginal Relevance: trade a little relevance for
+    /// novelty so recall does not return several near-duplicate memories.
+    /// Off by default (pure relevance order); most useful with `budget_tokens`
+    /// when a hook injects a handful of cards and each one should earn its slot.
+    pub diversify: bool,
 }
 
 impl Default for RecallOpts {
@@ -58,6 +63,7 @@ impl Default for RecallOpts {
             min_score_micros: 0,
             scope: None,
             budget_tokens: None,
+            diversify: false,
         }
     }
 }
@@ -203,6 +209,82 @@ fn card_token_cost(hit: &RecallHit) -> usize {
     chars / 4 + 8
 }
 
+/// Integer Jaccard similarity between two memories' indexed term sets, in
+/// micro-units: `|A ∩ B| * SCALE / |A ∪ B|`, or 0 when both are empty. Floats
+/// are banned in recall, so this is the deterministic novelty measure MMR uses.
+fn jaccard_micros(a: &BTreeSet<&str>, b: &BTreeSet<&str>) -> i64 {
+    if a.is_empty() && b.is_empty() {
+        return 0;
+    }
+    let inter = a.intersection(b).count() as i64;
+    let union = a.union(b).count() as i64;
+    if union == 0 {
+        0
+    } else {
+        inter.saturating_mul(ppr::SCALE) / union
+    }
+}
+
+/// Reorder hits for diversity (Maximal Marginal Relevance): greedily choose the
+/// hit that best trades relevance against novelty relative to what is already
+/// chosen, so recall does not surface several near-duplicate memories. Ties
+/// resolve to the earlier (higher-ranked) hit, so the order stays total and
+/// deterministic. Relevance is each hit's score normalised against the top hit;
+/// novelty is `1 - max Jaccard` to the already-selected set.
+fn mmr_reorder(hits: Vec<RecallHit>, index: &Index) -> Vec<RecallHit> {
+    if hits.len() <= 2 {
+        return hits;
+    }
+    // λ = 1/2: relevance and novelty weighted equally, so an exact duplicate
+    // of an already-chosen hit (redundancy 1) nets zero and loses its slot to
+    // any distinct memory that is still relevant. This is what "do not return
+    // several near-duplicates" requires; pure-relevance order stays the
+    // default (this pass only runs under --diverse).
+    const LAMBDA_NUM: i64 = 1;
+    const LAMBDA_DEN: i64 = 2;
+    let sets: Vec<BTreeSet<&str>> = hits
+        .iter()
+        .map(|h| {
+            index
+                .docs
+                .get(&h.id)
+                .map(|e| e.tf.keys().map(String::as_str).collect())
+                .unwrap_or_default()
+        })
+        .collect();
+    let max_rel = hits
+        .iter()
+        .map(|h| h.score_micros)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+
+    let mut remaining: Vec<usize> = (0..hits.len()).collect();
+    let mut order: Vec<usize> = Vec::new();
+    while !remaining.is_empty() {
+        let mut best_rp = 0usize;
+        let mut best_score = i64::MIN;
+        for (rp, &i) in remaining.iter().enumerate() {
+            let rel = hits[i].score_micros.saturating_mul(ppr::SCALE) / max_rel;
+            let mut maxsim = 0i64;
+            for &j in &order {
+                let s = jaccard_micros(&sets[i], &sets[j]);
+                if s > maxsim {
+                    maxsim = s;
+                }
+            }
+            // MMR = λ·relevance − (1−λ)·redundancy.
+            let mmr = (LAMBDA_NUM * rel - (LAMBDA_DEN - LAMBDA_NUM) * maxsim) / LAMBDA_DEN;
+            if mmr > best_score {
+                best_score = mmr;
+                best_rp = rp;
+            }
+        }
+        order.push(remaining.remove(best_rp));
+    }
+    order.into_iter().map(|i| hits[i].clone()).collect()
+}
+
 /// Does this memory pass the mtype/tag/scope filters? Applied while
 /// assembling, so filters never starve a later result. A memory with no
 /// scope is `global` and passes any scope filter.
@@ -328,6 +410,11 @@ pub fn recall(store: &Store, query: &str, opts: &RecallOpts) -> Result<RecallRes
             .cmp(&a.score_micros)
             .then_with(|| a.id.cmp(&b.id))
     });
+
+    // Optional diversity pass: demote near-duplicates before packing.
+    if opts.diversify {
+        hits = mmr_reorder(hits, &index);
+    }
 
     // Pack under k and (optionally) the token budget.
     let mut out = Vec::new();
@@ -533,6 +620,63 @@ mod tests {
         // No overlap.
         let r = recall(&store, "xylophone quantum", &RecallOpts::default()).unwrap();
         assert!(r.hits.is_empty());
+    }
+
+    #[test]
+    fn diversify_demotes_a_near_duplicate() {
+        let tmp = TempDir::new("recall-mmr");
+        let store = Store::open(tmp.path());
+        let clock = FixedClock(T0);
+        let mk = |title: &str, body: &str| {
+            store
+                .create(
+                    &NewMemory {
+                        mtype: Some(MemoryType::Rule),
+                        title: title.to_string(),
+                        body: format!("{body}\n"),
+                        ..NewMemory::default()
+                    },
+                    &clock,
+                )
+                .unwrap()
+                .id
+        };
+        // a and b are content-identical (same term set): a perfect duplicate
+        // pair. c is distinct but still matches the query.
+        let a = mk("sync branch primary", "sync branch details here");
+        let b = mk("sync branch primary", "sync branch details here");
+        let c = mk(
+            "sync over git remote",
+            "sync branch travels over your git remote",
+        );
+        let q = "sync branch";
+
+        // Pure relevance keeps the identical twins adjacent at the top.
+        let plain = recall(&store, q, &RecallOpts::default()).unwrap();
+        assert_eq!(plain.hits.len(), 3);
+        assert_eq!(plain.hits[0].id, a);
+        assert_eq!(
+            plain.hits[1].id, b,
+            "plain order buries the distinct memory"
+        );
+
+        // Diversity pushes the exact duplicate out of rank 2 for the novel one.
+        let diverse = recall(
+            &store,
+            q,
+            &RecallOpts {
+                diversify: true,
+                ..RecallOpts::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(diverse.hits[0].id, a, "top hit unchanged");
+        assert_ne!(diverse.hits[1].id, b, "MMR demotes the near-duplicate");
+        assert_eq!(diverse.hits[1].id, c, "the distinct memory takes rank 2");
+        assert!(
+            diverse.hits.iter().any(|h| h.id == b),
+            "the duplicate is demoted, not dropped"
+        );
     }
 
     #[test]

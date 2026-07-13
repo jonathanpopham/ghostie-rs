@@ -32,7 +32,8 @@ seeds a Personalized PageRank walk with those hits and follows `links` between
 memories. A memory linked to a match surfaces even when it shares no words with
 the query, and it names the edge that carried it. Every hit shows its why.
 `--budget N` caps the result in tokens so a context-injection hook never
-floods; `--scope` keeps recall focused on one project.
+floods; `--diverse` demotes near-duplicate memories (MMR) so each card earns
+its slot; `--scope` keeps recall focused on one project.
 
 ```sh
 ghostie remember --type decision "Chose DuckDB over Postgres" \
