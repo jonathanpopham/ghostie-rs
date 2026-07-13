@@ -46,22 +46,25 @@ Retrieval is literal-token today (no stemming or embeddings): near-miss wording
 can miss, which the link graph and a future hash-embedding rerank are meant to
 cover.
 
-## Two buttons, and it just works
+## One button, and it just works
 
-The point of provider-agnostic memory is that it moves with you. Two commands
-wire that up:
+The point of provider-agnostic memory is that it moves with you. One command
+wires that up:
 
 ```sh
-ghostie sync --init <your-git-remote>   # 1. your own remote (any git host)
-ghostie hook install --sync             # 2. auto-recall + auto-capture
+ghostie setup <your-git-remote>   # any git host; omit the remote for local-only
 ```
 
-After that, in Claude Code: relevant memories are recalled and injected on each
-prompt (bounded by a token budget), and when a session ends the transcript is
-captured into memories, then committed and pushed to your remote. Sit down at
-another machine, `ghostie sync --init` the same remote, and your context is
+That wires the store to your own remote, installs the hooks, and does the first
+push. After it, in Claude Code: relevant memories are recalled and injected on
+each prompt (bounded by a token budget), and when a session ends the transcript
+is captured into memories, then committed and pushed to your remote. Sit down at
+another machine, run the same `ghostie setup <remote>`, and your context is
 there. `ghostie hook status` shows what is wired; `ghostie hook uninstall`
 removes it, leaving your other settings untouched.
+
+Under the button are the parts, usable on their own: `ghostie sync --init
+<remote>` then `ghostie sync`, and `ghostie hook install`.
 
 `ghostie capture <transcript>` distills a session by hand: a session-summary
 carrying provenance plus one memory per `MEMORY <type>: ...` marker left in the

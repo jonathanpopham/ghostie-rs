@@ -84,6 +84,7 @@ pub fn execute(args: &[String], stdin_body: Option<&str>) -> CliOutput {
         }),
         "sync" => wrap(command, &parsed, |store| cmd_sync(store, rest, json_mode)),
         "hook" => wrap(command, &parsed, |store| cmd_hook(store, rest, json_mode)),
+        "setup" => wrap(command, &parsed, |store| cmd_setup(store, rest, json_mode)),
         other => {
             let e = Error::Usage {
                 message: format!("unknown command '{other}'; try `ghostie help`"),
@@ -261,6 +262,7 @@ USAGE
   ghostie <command> [args] [--json] [--store <path>] [--quiet]
 
 COMMANDS
+  setup      one command to make it just work (see below)
   remember   create a memory from the command line
   recall     query the store; ranked hits, each with a why
   list       enumerate memories deterministically
@@ -270,10 +272,10 @@ COMMANDS
   help       this text; `ghostie help <command>` for details
   version    print the version
 
-THE TWO BUTTONS (make it just work)
-  ghostie sync --init <your-git-remote>   # 1. wire your own remote
-  ghostie hook install --sync             # 2. auto-recall on prompts,
-                                          #    auto-capture + push on session end
+ONE BUTTON (make it just work)
+  ghostie setup <your-git-remote>   # wire sync + install auto-recall/capture
+                                    # + first push, in one command
+  ghostie setup                     # local only (hooks, no cross-device sync)
 
 GLOBAL FLAGS
   --json           robot mode: exactly one JSON document on stdout
@@ -346,6 +348,21 @@ EXAMPLES
 EXIT CODES: 0 success · 1 failure · 2 bad arguments
 ";
 
+const HELP_SETUP: &str = "\
+ghostie setup [<git-remote>] [--budget N]
+
+  The one button. With a remote: wires the store to your own git remote,
+  installs the recall-on-prompt and capture-on-end hooks (with sync), and does
+  the first push. Without a remote: installs the hooks local-only.
+  --budget <N>   token budget for the recall-on-prompt injection (default 600)
+
+EXAMPLES
+  ghostie setup git@github.com:me/my-memory.git
+  ghostie setup                       # local, no cross-device sync
+
+EXIT CODES: 0 success · 1 failure · 2 bad arguments · 3 sync conflict
+";
+
 const HELP_CAPTURE: &str = "\
 ghostie capture <transcript-path> [--harness h] [--core c]
 
@@ -389,6 +406,7 @@ EXIT CODES: 0 success · 1 failure · 2 bad arguments
 
 fn help(rest: &[String], json_mode: bool) -> CliOutput {
     let text = match rest.first().map(String::as_str) {
+        Some("setup") => HELP_SETUP,
         Some("remember") => HELP_REMEMBER,
         Some("recall") => HELP_RECALL,
         Some("list") => HELP_LIST,
@@ -1172,6 +1190,102 @@ fn cmd_hook(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
         }
         other => Err(usage(format!("unknown hook subcommand '{other}'"))),
     }
+}
+
+/// `setup [<git-remote>] [--budget N]`: the one button. Wires your own remote
+/// (when given), installs the recall + capture hooks, and does the first push,
+/// so cross-provider memory just works after a single command.
+fn cmd_setup(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, Error> {
+    let usage = |message: String| Error::Usage { message };
+    let mut remote: Option<String> = None;
+    let mut budget = hook::DEFAULT_BUDGET;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--budget" => {
+                i += 1;
+                budget = rest
+                    .get(i)
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .ok_or_else(|| usage("--budget requires a number".to_string()))?;
+            }
+            a if a.starts_with('-') => {
+                return Err(usage(format!("unknown flag '{a}' for setup")));
+            }
+            positional => {
+                if remote.is_some() {
+                    return Err(usage("setup takes one git remote".to_string()));
+                }
+                remote = Some(positional.to_string());
+            }
+        }
+        i += 1;
+    }
+    let do_sync = remote.is_some();
+    let mut warnings = Vec::new();
+    let mut steps: Vec<String> = Vec::new();
+
+    if let Some(r) = &remote {
+        sync::sync_init(store, r)?;
+        steps.push(format!("sync wired to {r}"));
+    }
+    let settings = hook::claude_settings_path()?;
+    let rep = hook::install_at(&settings, store.root(), budget, do_sync)?;
+    steps.push(format!(
+        "recall + capture hooks installed{}",
+        if rep.backed_up {
+            " (settings backed up)"
+        } else {
+            ""
+        }
+    ));
+    let mut synced = false;
+    if do_sync {
+        let clock = resolve_clock()?;
+        match sync::sync(store, clock.as_ref()) {
+            Ok(_) => {
+                synced = true;
+                steps.push("initial sync pushed".to_string());
+            }
+            Err(e) => warnings.push(Warning {
+                origin: "setup".to_string(),
+                message: format!("initial sync skipped ({e}); it will run on session end"),
+            }),
+        }
+    }
+
+    let mut human = String::from(if do_sync {
+        "ghostie is set up.\n"
+    } else {
+        "ghostie is set up (local only).\n"
+    });
+    for s in &steps {
+        human.push_str(&format!("  done: {s}\n"));
+    }
+    if !do_sync {
+        human.push_str("add cross-device sync anytime: ghostie setup <your-git-remote>\n");
+    }
+    human.push_str("restart Claude Code (or open a new session) to activate\n");
+
+    Ok(CmdOk {
+        data: Value::Object(vec![
+            (
+                "remote".to_string(),
+                match &remote {
+                    Some(r) => Value::string(r.clone()),
+                    None => Value::Null,
+                },
+            ),
+            (
+                "settings".to_string(),
+                Value::string(rep.path.display().to_string()),
+            ),
+            ("hooks_installed".to_string(), Value::Bool(true)),
+            ("synced".to_string(), Value::Bool(synced)),
+        ]),
+        human,
+        warnings,
+    })
 }
 
 #[cfg(test)]
