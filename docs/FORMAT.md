@@ -41,7 +41,7 @@ The body is everything after the closing `---` line's newline, verbatim
 block at all is an error: the first line of a memory file MUST be exactly
 `---`.
 
-## Frontmatter grammar (restricted, self-defined — NOT full YAML)
+## Frontmatter grammar (restricted, self-defined, NOT full YAML)
 
 Full YAML is a determinism tarpit and would need an external parser. The
 frontmatter is a deliberately tiny language:
@@ -59,7 +59,7 @@ frontmatter is a deliberately tiny language:
 
 A scalar is written **bare** iff it is non-empty and:
 
-- contains none of: `"` `[` `]` `,` `#` — and no control characters
+- contains none of: `"` `[` `]` `,` `#`, and no control characters
   (including newline/tab), and
 - has no leading or trailing space or tab.
 
@@ -93,6 +93,10 @@ Optional:
 | `links` | list of memory ids this memory relates to |
 | `source` | for captured memories: `<harness>:<session_id>` (meaningful on `session-summary`) |
 | `supersedes` | id of the decision this decision replaces (meaningful on `decision`) |
+| `harness` | provenance: which harness created the memory (`claude-code`, `hermes`) |
+| `core` | provenance: which model produced it (`opus-4.8`, `hermes-4-405b`) |
+| `rationale` | why the memory is necessary; the why-line surfaced on the recall card |
+| `scope` | retrieval scope: `global` (default when absent) or `project:<name>` |
 
 Type-scoping is warn-not-error: `supersedes` on a non-decision or `source`
 on a non-session-summary parses fine and is preserved, but validation
@@ -112,11 +116,11 @@ Canonical form is:
 
 1. Line 1: `---` exactly.
 2. Frontmatter keys in **schema order**: `id`, `type`, `created`, `title`,
-   `tags`, `links`, `source`, `supersedes` — then unknown keys, in
-   first-seen order. Absent/empty optional fields are omitted entirely (no
-   `tags: []` noise).
+   `tags`, `links`, `source`, `supersedes`, `harness`, `core`, `rationale`,
+   `scope`, then unknown keys, in first-seen order. Absent/empty optional
+   fields are omitted entirely (no `tags: []` noise).
 3. Exactly one space after the colon: `key: value`. List form
-   `key: [a, b]` — one space after each comma, none inside the brackets.
+   `key: [a, b]`, one space after each comma, none inside the brackets.
 4. Closing `---` line immediately after the last key line (no blank lines
    inside the frontmatter block).
 5. The body follows, verbatim except line endings normalized to LF.
@@ -172,7 +176,7 @@ The files are yours. Edit them with anything. To stay friction-free:
   `---`. Don't repeat a key.
 - Quote a value only if it needs `"`, `[`, `]`, `,`, `#`, or edges of
   whitespace; inside quotes escape `\"` and `\\`.
-- Add your own keys freely (`priority: high`) — ghostie preserves them.
+- Add your own keys freely (`priority: high`); ghostie preserves them.
 - Don't edit `id` (it's the filename and what other memories link to) or
   `created`.
 - CRLF, stray blank lines, and reordered keys are all tolerated; the next

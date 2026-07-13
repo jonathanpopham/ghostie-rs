@@ -2,5 +2,8 @@
 name = "ghostie"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Provider-agnostic memory you own: plain-file store, deterministic graph-aware recall, and one-command cross-device sync. Rust, std-only, zero dependencies."
+repository = "https://github.com/jonathanpopham/ghostie-rs"
 
 [dependencies]

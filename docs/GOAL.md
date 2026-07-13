@@ -1,4 +1,4 @@
-# Goal: ghostie, rebuilt — memory you own, in Rust
+# Goal: ghostie, rebuilt: memory you own, in Rust
 
 ## The mission
 
@@ -32,28 +32,29 @@ airgap-capable, provider-agnostic). This rewrite makes those true:
 - CI runs on a local Linux box (Docker) as well as GitHub, proving it builds
   the same on the dev machine and in CI.
 
-## Capabilities (the shape of the work — expand into beads)
+## Capabilities (the shape of the work; expand into beads)
 
-1. **Store** — the on-disk memory format and CRUD. A memory is a file with
+1. **Store**: the on-disk memory format and CRUD. A memory is a file with
    typed frontmatter (a fact, a decision, a rule, a session summary) plus body.
    Deterministic serialization; an index for fast lookup that is derivable and
    never authoritative over the files themselves.
-2. **Capture** — ingest agent session logs from multiple harnesses (Claude
+2. **Capture**: ingest agent session logs from multiple harnesses (Claude
    Code JSONL, Codex, others) into a unified, provider-agnostic session record.
    The parsers are pluggable; adding a harness does not change the core.
-3. **Recall** — given a task or query, surface the relevant memories.
-   Deterministic retrieval (clean-room BM25 + hash-embedding rerank, std-only),
-   with an explanation of *why* each result matched. This is the value: the
-   right context, resurfaced, without a cloud.
-4. **Sync** — cross-device via the user's own git remote. Deterministic,
+3. **Recall**: given a task or query, surface the relevant memories.
+   Deterministic retrieval (clean-room BM25 plus a Personalized-PageRank walk
+   over the link graph, std-only; a hash-embedding rerank is future work), with
+   an explanation of *why* each result matched. This is the value: the right
+   context, resurfaced, without a cloud.
+4. **Sync**: cross-device via the user's own git remote. Deterministic,
    conflict-aware at the file level, provider-agnostic. No proprietary sync
    service. Implemented by shelling to the system `git` binary (an external
    *tool*, present everywhere, NOT a crate dependency), so crate-level
    zero-dependency is preserved. This mirrors how Lockstep shells to POSIX
    `kill`: the toolbox stays std-only; the OS's own utilities are fair game.
-5. **CLI + robot mode** — `ghostie remember`, `recall`, `capture`, `sync`,
+5. **CLI + robot mode**: `ghostie remember`, `recall`, `capture`, `sync`,
    `list`, each with `--json`. Ergonomic for humans, scriptable for agents.
-6. **Gate** — the gatekit-pattern `verify.sh` grown into a real gate: fmt,
+6. **Gate**: the gatekit-pattern `verify.sh` grown into a real gate: fmt,
    clippy (deny warnings), build, test, a dogfood run (capture a fixture
    session, recall against it, assert the expected memory surfaces), and a
    byte-stability check on the store format. CI is a thin wrapper that runs it.
