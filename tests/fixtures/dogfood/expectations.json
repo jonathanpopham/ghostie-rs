@@ -1,0 +1,77 @@
+{
+  "_doc": "Dogfood expectations for the lantern corpus. One corpus, one truth: consumed by (1) recall golden tests, (2) the gate DOGFOOD step in scripts/verify.sh, (3) the Milestone 1 demo. Schema: entries[] of { query: str, expect_top: [ids acceptable at rank 1], expect_in_top_k: [{id, k}], forbid_in_top_k: [{id, k}], expect_zero_hits: bool, phase: 'milestone' | 'post-milestone', note: str }. All fields except query and phase are optional. forbid entries are negative cases; expect_zero_hits demands an empty result.",
+  "_distractors": [
+    "fact-release-artifacts-live-in-dist-1",
+    "fact-ci-runs-on-debian-1",
+    "session-summary-added-jsonl-reader-for-event-logs-1",
+    "decision-pinned-the-rust-toolchain-1"
+  ],
+  "entries": [
+    {
+      "query": "which branch do we sync to",
+      "phase": "milestone",
+      "expect_top": ["rule-sync-branch-is-sync-never-main-1"],
+      "forbid_in_top_k": [{"id": "fact-ci-runs-on-debian-1", "k": 3}]
+    },
+    {
+      "query": "why did we avoid floats",
+      "phase": "milestone",
+      "expect_top": ["decision-chose-fixed-point-scoring-over-floats-1"]
+    },
+    {
+      "query": "what do I run before committing",
+      "phase": "milestone",
+      "expect_top": ["rule-always-run-verify-sh-before-commit-1"]
+    },
+    {
+      "query": "parse event stream",
+      "phase": "milestone",
+      "expect_top": ["fact-parseeventstream-is-the-hot-path-1"],
+      "note": "resolved ONLY via code-aware subtokens of the camelCase symbol parseEventStream"
+    },
+    {
+      "query": "what did the last session change in the tokenizer",
+      "phase": "milestone",
+      "expect_top": ["session-summary-fixed-tokenizer-bug-dropping-digits-1"],
+      "forbid_in_top_k": [{"id": "session-summary-added-jsonl-reader-for-event-logs-1", "k": 1}]
+    },
+    {
+      "query": "where does the default config live",
+      "phase": "milestone",
+      "expect_top": ["fact-default-config-path-is-etc-lantern-toml-1"],
+      "expect_in_top_k": [{"id": "fact-lantern-repo-layout-1", "k": 3}]
+    },
+    {
+      "query": "rules about logging user data",
+      "phase": "milestone",
+      "expect_top": ["rule-never-log-raw-user-paths-1"]
+    },
+    {
+      "query": "storage engine sqlite decision",
+      "phase": "milestone",
+      "expect_top": ["decision-sqlite-rejected-for-storage-1"]
+    },
+    {
+      "query": "where do built binaries end up",
+      "phase": "milestone",
+      "expect_top": ["fact-release-artifacts-live-in-dist-1"]
+    },
+    {
+      "query": "kubernetes ingress warp drive",
+      "phase": "milestone",
+      "expect_zero_hits": true
+    },
+    {
+      "query": "how do we version a release",
+      "phase": "milestone",
+      "expect_top": ["rule-tag-releases-with-semver-1"],
+      "note": "the release tag and the version body token carry this one today"
+    },
+    {
+      "query": "why no db",
+      "phase": "post-milestone",
+      "expect_top": ["decision-sqlite-rejected-for-storage-1"],
+      "note": "near-synonym case reserved for the hash-embedding rerank bead: 'db' has no exact-token bridge to 'database'/'sqlite' — BM25 returns zero hits today (verified); only a semantic rerank layer can close it"
+    }
+  ]
+}

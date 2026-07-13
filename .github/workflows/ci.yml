@@ -1,0 +1,14 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Install the toolchain pinned in rust-toolchain.toml (rustup reads
+      # it; the explicit toolchain here keeps the action from floating).
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.0
+          components: clippy, rustfmt
+      - run: ./scripts/verify.sh

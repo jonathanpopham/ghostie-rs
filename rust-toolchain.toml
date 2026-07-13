@@ -1,0 +1,9 @@
+# Pinned toolchain: golden tests freeze Unicode lowercasing and clippy
+# behavior, both of which drift across rustc releases — every rustup
+# environment (GitHub CI, the Docker gate, rustup dev machines) MUST
+# resolve the same compiler. NOTE: the macOS dev box uses Homebrew rust
+# (no rustup), which ignores this file; the gate still runs there, and
+# the Docker + GitHub runs are the pinned truth.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
