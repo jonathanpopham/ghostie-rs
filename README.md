@@ -1,4 +1,4 @@
-# ghostie — memory you own
+# ghostie: memory you own
 
 Provider-agnostic memory for AI coding work. Your context lives in a store you
 own and can read: portable across sessions, across agents, and across devices.
