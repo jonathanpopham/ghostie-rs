@@ -75,6 +75,37 @@ Status: the store, provenance, graph-aware recall, capture, sync, and the hook
 installer are working and gated. Richer model-driven distillation is the one
 deliberately impure, feature-gated step still ahead. See `docs/GOAL.md`.
 
+## Use ghostie as an MCP server
+
+Any MCP client (Codex, Cursor, Claude, Windsurf, Zed) can use your store as its
+memory. `ghostie mcp serve` speaks the Model Context Protocol over stdio:
+newline-delimited JSON-RPC 2.0, one request per line. It exposes four tools:
+
+- `recall` (query, budget?, k?, scope?): the ranked memories for a task, each
+  with its why and provenance.
+- `remember` (type, title, body?, tags?, harness?, core?, rationale?, scope?):
+  create a memory, returns the new id.
+- `capture` (path, format?, harness?): distill a session transcript into memories.
+- `list`: every memory in the store.
+
+Point your client's MCP config at the `ghostie` binary. For a client that reads
+`~/.config` style JSON (adapt the exact path to your client):
+
+```json
+{
+  "mcpServers": {
+    "ghostie": {
+      "command": "ghostie",
+      "args": ["mcp", "serve"]
+    }
+  }
+}
+```
+
+`ghostie mcp` with no argument prints a one-shot manifest (server name, version,
+and the tool list); `ghostie mcp --json` emits it as a single JSON envelope, so
+a tool can discover the surface without starting the server.
+
 ## CI
 
 `scripts/verify.sh` is the gate: fmt, clippy (deny warnings), build, test,

@@ -31,8 +31,8 @@ use std::path::PathBuf;
 
 /// Subcommands implemented so far, in help order. The robot audit and the
 /// e2e suite iterate THIS list, so a new verb is auto-covered.
-pub const SUBCOMMANDS: [&str; 7] = [
-    "setup", "remember", "recall", "list", "capture", "sync", "hook",
+pub const SUBCOMMANDS: [&str; 8] = [
+    "setup", "remember", "recall", "list", "capture", "sync", "hook", "mcp",
 ];
 
 /// Everything a command run produces; `run` prints it, tests assert on it.
@@ -86,6 +86,7 @@ pub fn execute(args: &[String], stdin_body: Option<&str>) -> CliOutput {
         }),
         "sync" => wrap(command, &parsed, |store| cmd_sync(store, rest, json_mode)),
         "hook" => wrap(command, &parsed, |store| cmd_hook(store, rest, json_mode)),
+        "mcp" => wrap(command, &parsed, |store| cmd_mcp(store, rest, json_mode)),
         "setup" => wrap(command, &parsed, |store| cmd_setup(store, rest, json_mode)),
         other => {
             let e = Error::Usage {
@@ -271,6 +272,7 @@ COMMANDS
   capture    distill a session log into memories
   sync       sync the store via your own git remote (--init <remote> first)
   hook       auto-recall / auto-capture: `hook install`, `status`, `uninstall`
+  mcp        serve ghostie as an MCP server (`mcp serve`) for any MCP client
   help       this text; `ghostie help <command>` for details
   version    print the version
 
@@ -415,6 +417,22 @@ ghostie hook <subcommand>
 EXIT CODES: 0 success · 1 failure · 2 bad arguments
 ";
 
+const HELP_MCP: &str = "\
+ghostie mcp [serve]
+
+  Serve ghostie as a Model Context Protocol (MCP) server so any MCP client
+  (Codex, Cursor, Claude, Windsurf, Zed) can use your store as its memory.
+
+  serve       run the server: newline-delimited JSON-RPC 2.0 over stdin/stdout.
+              Tools exposed: recall, remember, capture, list.
+  (no args)   print a one-shot manifest (server name/version + the tool list)
+              and exit; `mcp --json` emits it as a single JSON envelope.
+
+  Point your client's MCP config at command \"ghostie\" with args [\"mcp\", \"serve\"].
+
+EXIT CODES: 0 success · 1 failure · 2 bad arguments
+";
+
 fn help(rest: &[String], json_mode: bool) -> CliOutput {
     let text = match rest.first().map(String::as_str) {
         Some("setup") => HELP_SETUP,
@@ -424,6 +442,7 @@ fn help(rest: &[String], json_mode: bool) -> CliOutput {
         Some("capture") => HELP_CAPTURE,
         Some("sync") => HELP_SYNC,
         Some("hook") => HELP_HOOK,
+        Some("mcp") => HELP_MCP,
         _ => HELP,
     };
     let mut out = CliOutput::default();
@@ -1267,6 +1286,55 @@ fn cmd_hook(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
             })
         }
         other => Err(usage(format!("unknown hook subcommand '{other}'"))),
+    }
+}
+
+/// `mcp serve` runs the MCP stdio server (a long-running JSON-RPC loop that
+/// reads stdin and writes responses directly); bare `mcp` (and `mcp --json`)
+/// prints a one-shot manifest envelope (server identity + tool list) and
+/// exits, so the verb honors the robot-mode contract without blocking.
+fn cmd_mcp(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, Error> {
+    let usage = |message: String| Error::Usage { message };
+    match rest.first().map(String::as_str) {
+        Some("serve") => {
+            // The server writes JSON-RPC responses to stdout itself and returns
+            // on stdin EOF; nothing is added to the envelope path.
+            crate::mcp::serve(store)?;
+            Ok(CmdOk {
+                data: Value::Object(vec![("served".to_string(), Value::Bool(true))]),
+                human: String::new(),
+                warnings: Vec::new(),
+            })
+        }
+        None => {
+            // Manifest: server identity + the tool catalog, one-shot.
+            let data = crate::mcp::manifest_data();
+            let tool_names: Vec<String> = data
+                .get("tools")
+                .and_then(Value::as_array)
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .filter_map(|t| t.get("name").and_then(Value::as_str))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let human = format!(
+                "ghostie MCP server {} (protocol {})\ntools: {}\nrun `ghostie mcp serve` and point your MCP client at it\n",
+                crate::mcp::server_version(),
+                crate::mcp::PROTOCOL_VERSION,
+                tool_names.join(", "),
+            );
+            Ok(CmdOk {
+                data,
+                human,
+                warnings: Vec::new(),
+            })
+        }
+        Some(other) => Err(usage(format!(
+            "unknown mcp subcommand '{other}' (serve, or no argument for the manifest)"
+        ))),
     }
 }
 

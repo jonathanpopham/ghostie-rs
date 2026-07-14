@@ -17,6 +17,7 @@ pub mod cli;
 mod error;
 pub mod hook;
 pub mod json;
+pub mod mcp;
 pub mod recall;
 pub mod store;
 pub mod sync;
