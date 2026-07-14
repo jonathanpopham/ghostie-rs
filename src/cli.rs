@@ -397,6 +397,12 @@ ghostie capture --latest codex [--scope s]
   --harness <h>   override the recorded harness (claude-code | codex | hermes)
   --core <c>      override the recorded model
   --scope <s>     stamp a retrieval scope (global | project:<name>)
+  --distill       also distill decisions/rules/facts from the transcript, not
+                  just explicit markers. Deterministic std-only heuristic by
+                  default (airgap-pure); a build compiled with --features distill
+                  may shell to an external agent, falling back to the heuristic
+  --distill-cmd <c>  (implies --distill) the agent command to shell to; only
+                  active in a --features distill build (else the heuristic runs)
   --no-redact     ingest verbatim; skip the default secret scrubbing
 
   By default capture scrubs detected secrets (API keys, tokens, private keys)
@@ -427,9 +433,13 @@ EXIT CODES: 0 success · 1 failure · 2 bad arguments · 3 sync conflict
 const HELP_HOOK: &str = "\
 ghostie hook <subcommand>
 
-  install [--budget N] [--sync]   wire Claude Code to recall relevant memories
+  install [--budget N] [--sync] [--distill]
+                                  wire Claude Code to recall relevant memories
                                   on each prompt and capture (and optionally
-                                  push) on session end; backs up settings first
+                                  push) on session end; backs up settings first.
+                                  --distill also distills decisions/rules/facts
+                                  (heuristic by default; model path needs a
+                                  --features distill build)
   install --harness codex [--sync]
                                   wire Codex: set its `notify` program in
                                   ~/.codex/config.toml so each completed turn
@@ -440,8 +450,10 @@ ghostie hook <subcommand>
   uninstall [--harness codex]     remove ghostie's hooks, leave the rest
   run recall [--budget N]         runner: reads the hook payload on stdin,
                                   emits injectable context (invoked by install)
-  run capture [--sync]            runner: captures the transcript named in the
-                                  payload, optionally syncs
+  run capture [--sync] [--distill]
+                                  runner: captures the transcript named in the
+                                  payload, optionally syncs; --distill distills
+                                  richer memories (heuristic by default)
   run capture --codex-notify [--sync]
                                   runner Codex calls: reads the notify event
                                   (last argv arg) and captures the newest
@@ -1038,9 +1050,24 @@ fn cmd_capture(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk
     let mut format: Option<capture::Format> = None;
     let mut latest: Option<String> = None;
     let mut no_redact = false;
+    let mut distill = false;
+    let mut distill_cmd: Option<String> = None;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
+            // Opt-in richer distillation: pull decisions/rules/facts out of the
+            // transcript (heuristic by default; the model path is feature-gated
+            // and only active in a `--features distill` build).
+            "--distill" => distill = true,
+            "--distill-cmd" => {
+                i += 1;
+                distill_cmd = Some(
+                    rest.get(i)
+                        .ok_or_else(|| usage("--distill-cmd requires a command".to_string()))?
+                        .clone(),
+                );
+                distill = true;
+            }
             "--latest" => {
                 i += 1;
                 latest = Some(
@@ -1129,15 +1156,29 @@ fn cmd_capture(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk
     if no_redact {
         store.set_redaction(false);
     }
-    let created = capture::capture_file(
-        store,
-        &path,
-        format,
-        harness.as_deref(),
-        core.as_deref(),
-        scope.as_deref(),
-        clock.as_ref(),
-    )?;
+    let created = if distill {
+        let distiller = crate::distill::build_distiller(distill_cmd.as_deref());
+        capture::capture_file_with_distill(
+            store,
+            &path,
+            format,
+            harness.as_deref(),
+            core.as_deref(),
+            scope.as_deref(),
+            distiller.as_ref(),
+            clock.as_ref(),
+        )?
+    } else {
+        capture::capture_file(
+            store,
+            &path,
+            format,
+            harness.as_deref(),
+            core.as_deref(),
+            scope.as_deref(),
+            clock.as_ref(),
+        )?
+    };
     let items: Vec<Value> = created
         .iter()
         .map(|m| {
@@ -1281,6 +1322,10 @@ fn cmd_hook(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
                 }
                 "capture" => {
                     let do_sync = rest.iter().any(|a| a == "--sync");
+                    // Opt-in distillation on the SessionEnd runner (default off,
+                    // airgap-pure heuristic unless a `--features distill` build
+                    // has a configured agent).
+                    let distill = rest.iter().any(|a| a == "--distill");
                     let clock = resolve_clock()?;
                     // Codex path: no transcript in the event; find + capture the
                     // newest rollout. Codex appends the event JSON as the last
@@ -1299,7 +1344,7 @@ fn cmd_hook(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
                             clock.as_ref(),
                         )?
                     } else {
-                        hook::run_capture(store, &stdin, do_sync, clock.as_ref())?
+                        hook::run_capture(store, &stdin, do_sync, distill, clock.as_ref())?
                     };
                     Ok(CmdOk {
                         data: Value::Object(vec![(
@@ -1316,6 +1361,7 @@ fn cmd_hook(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
         "install" => {
             let mut budget = hook::DEFAULT_BUDGET;
             let mut do_sync = false;
+            let mut distill = false;
             let mut harness = "claude-code".to_string();
             let mut i = 1;
             while i < rest.len() {
@@ -1328,6 +1374,10 @@ fn cmd_hook(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
                             .ok_or_else(|| usage("--budget requires a number".to_string()))?;
                     }
                     "--sync" => do_sync = true,
+                    // Wire the SessionEnd capture command to distill (default
+                    // off). Airgap-pure heuristic unless a feature-on build has
+                    // an agent configured.
+                    "--distill" => distill = true,
                     "--harness" => {
                         i += 1;
                         harness = rest
@@ -1424,7 +1474,7 @@ fn cmd_hook(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
                 });
             }
             let settings = hook::claude_settings_path()?;
-            let rep = hook::install_at(&settings, store.root(), budget, do_sync)?;
+            let rep = hook::install_at(&settings, store.root(), budget, do_sync, distill)?;
             Ok(CmdOk {
                 data: Value::Object(vec![
                     (
@@ -1680,7 +1730,7 @@ fn cmd_setup(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, 
         steps.push(format!("sync wired to {r}"));
     }
     let settings = hook::claude_settings_path()?;
-    let rep = hook::install_at(&settings, store.root(), budget, do_sync)?;
+    let rep = hook::install_at(&settings, store.root(), budget, do_sync, false)?;
     steps.push(format!(
         "recall + capture hooks installed{}",
         if rep.backed_up {
@@ -2259,5 +2309,47 @@ rule-sync-branch-is-sync-never-main-1     rule      2026-07-13  Sync branch is s
         // --quiet silences human warnings.
         let quiet = run_in(&tmp, &["list", "--quiet"], None);
         assert!(quiet.stderr.is_empty());
+    }
+
+    #[test]
+    fn capture_distill_creates_extra_memories_end_to_end() {
+        let tmp = TempDir::new("cli-capture-distill");
+        let transcript = tmp.path().join("session.md");
+        // Plain-text transcript with a decision no MEMORY marker flagged.
+        std::fs::write(
+            &transcript,
+            "help me decide\nWe chose DuckDB over Postgres for the analytics store today.\nAlways run verify.sh before you commit.\n",
+        )
+        .unwrap();
+        let tp = transcript.display().to_string();
+
+        // Without --distill: just the session summary (no markers present).
+        let plain = run_in(&tmp, &["capture", &tp, "--json"], None);
+        assert_eq!(plain.exit_code, 0, "{}", plain.stderr);
+        let doc = crate::json::parse(plain.stdout.trim_end()).unwrap();
+        let n_plain = doc
+            .get("data")
+            .and_then(|d| d.get("created"))
+            .and_then(Value::as_array)
+            .map(<[_]>::len)
+            .unwrap();
+        assert_eq!(n_plain, 1, "summary only: {}", plain.stdout);
+
+        // With --distill on a FRESH store: summary + distilled decision + rule.
+        let tmp2 = TempDir::new("cli-capture-distill-2");
+        let out = run_in(&tmp2, &["capture", &tp, "--distill", "--json"], None);
+        assert_eq!(out.exit_code, 0, "{}", out.stderr);
+        let doc = crate::json::parse(out.stdout.trim_end()).unwrap();
+        let created = doc
+            .get("data")
+            .and_then(|d| d.get("created"))
+            .and_then(Value::as_array)
+            .unwrap();
+        assert!(created.len() >= 2, "distill adds memories: {}", out.stdout);
+        let types: Vec<&str> = created
+            .iter()
+            .filter_map(|m| m.get("type").and_then(Value::as_str))
+            .collect();
+        assert!(types.contains(&"decision"), "{types:?}");
     }
 }

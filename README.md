@@ -86,9 +86,37 @@ carrying provenance plus one memory per `MEMORY <type>: ...` marker left in the
 transcript. Sync shells to the system `git` binary (a tool, not a crate), so
 crate-level zero-dependency holds; conflicts are reported, never auto-resolved.
 
-Status: the store, provenance, graph-aware recall, capture, sync, and the hook
-installer are working and gated. Richer model-driven distillation is the one
-deliberately impure, feature-gated step still ahead. See `docs/GOAL.md`.
+### Smart auto-capture (`--distill`)
+
+Bare markers miss most of a session. `capture --distill` also mines the
+transcript for the decisions, rules, and facts nobody flagged, writing each as
+its own memory linked to the session summary. It is opt-in and default off.
+
+Two distillers sit behind one flag:
+
+- A deterministic, std-only **heuristic** ships in the default binary. It pulls
+  decision/rule/imperative-shaped sentences out of the transcript, dedupes, and
+  caps the count. Pure function of its input, so the store stays byte-stable,
+  and it runs fully offline. This is what `--distill` does in the shipped build.
+- A **model-backed** distiller is compiled only with `--features distill` (off
+  by default). It shells out to a configurable agent CLI (a tool, invoked via
+  `sh -c`, not a crate, exactly as sync shells to `git`), feeds it the
+  transcript, and reads back `MEMORY <type>: ...` lines. Configure it with
+  `--distill-cmd "<agent command>"` or the `GHOSTIE_DISTILL_CMD` environment
+  variable; a timeout (`GHOSTIE_DISTILL_TIMEOUT_SECS`, default 60) and a
+  fall-back to the heuristic mean it can only add memories, never hang capture
+  or lose the offline baseline.
+
+This is the one deliberately impure node: the default binary makes no model
+calls and keeps `[dependencies]` empty. Distillation runs before redaction, so
+the extractor sees the real transcript while every stored candidate is still
+scrubbed of secrets on the write path. Wire it into auto-capture with
+`ghostie hook install --distill`.
+
+Status: the store, provenance, graph-aware recall, capture (with heuristic
+distillation), sync, and the hook installer are working and gated. The
+model-backed distiller behind `--features distill` is the one deliberately
+impure, opt-in step. See `docs/GOAL.md`.
 
 ## Use ghostie as an MCP server
 
