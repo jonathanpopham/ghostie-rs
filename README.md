@@ -51,6 +51,36 @@ binary stays offline and byte-stable. A labeled eval (`cargo test --test eval
 goes from 0.00 (BM25 alone) to 1.00 with the rerank on. `recall --no-rerank`
 turns it off.
 
+## Lifecycle: forget, decay, prune
+
+A store that only ever grows eventually floods recall. Three verbs keep it
+sharp over months.
+
+`ghostie forget <id>` deletes one memory. It confirms first (answer y on stdin)
+or takes `--force`; in `--json` robot mode `--force` is required, so a script
+never deletes by surprise. There are no tombstones: git history is the record.
+
+Each memory can carry a `confidence` (micro-units, full when absent) and a
+`last_used` instant. Confidence decays on a half-life without reuse, so an old
+untouched note counts for a little less than a fresh one. Decay is a mild,
+integer-only prior and it is OFF by default, so ranking is unchanged unless you
+ask for it:
+
+```sh
+ghostie recall "auth approach" --decay   # sink stale memories a little
+ghostie recall "auth approach" --touch   # revalidate: restore full confidence
+```
+
+`ghostie prune` archives what has decayed below a floor. It is a dry-run by
+default (it only lists); `--force` moves the stale memories into
+`<store>/archive/`, keeping their bytes and git history but taking them out of
+recall. `--below <micros>` sets the floor (default 250000).
+
+```sh
+ghostie prune                 # show what would be archived
+ghostie prune --force         # archive it
+```
+
 ## One button, and it just works
 
 The point of provider-agnostic memory is that it moves with you. One command

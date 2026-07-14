@@ -86,6 +86,12 @@ pub struct Memory {
     /// Retrieval scope: `global` (default when absent) or `project:<name>`,
     /// so project memories do not flood unrelated work.
     pub scope: Option<String>,
+    /// Confidence in micro-units (0..=1_000_000; full when absent). Decays on a
+    /// half-life without reuse; reuse restores it. See [`crate::decay`].
+    pub confidence: Option<i64>,
+    /// Instant the memory was last used/revalidated, epoch seconds UTC. The
+    /// reference point for decay; falls back to `created` when absent.
+    pub last_used: Option<i64>,
     /// Human-added keys, preserved verbatim in first-seen order.
     pub unknown_keys: Vec<(String, FmValue)>,
     /// The Markdown body.
@@ -172,6 +178,11 @@ impl Memory {
         let core = scalar_field("core");
         let rationale = scalar_field("rationale");
         let scope = scalar_field("scope");
+        // Extract the lifecycle scalars here (while `scalar_field` is live), but
+        // parse them below AFTER the closure's last use, so warning pushes do
+        // not conflict with its mutable borrow of `warnings`.
+        let confidence_raw = scalar_field("confidence");
+        let last_used_raw = scalar_field("last_used");
 
         // Type-scoping: warn, never error.
         if supersedes.is_some() && mtype != MemoryType::Decision {
@@ -192,6 +203,40 @@ impl Memory {
                 ),
             });
         }
+
+        // Lifecycle fields (optional, schema-appended). Backward-compat: absent
+        // confidence means full; a malformed value is a warning, not a fatal
+        // error (be liberal, warn, never destroy a hand-edited file).
+        let confidence = match confidence_raw {
+            None => None,
+            Some(s) => match s.trim().parse::<i64>() {
+                Ok(v) => Some(v.clamp(0, crate::decay::FULL_CONFIDENCE_MICROS)),
+                Err(_) => {
+                    warnings.push(Warning {
+                        origin: origin.to_string(),
+                        message: format!(
+                            "field 'confidence' should be an integer 0..1000000 (micros); ignoring {s:?}"
+                        ),
+                    });
+                    None
+                }
+            },
+        };
+        let last_used = match last_used_raw {
+            None => None,
+            Some(s) => match parse_rfc3339_utc(&s) {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    warnings.push(Warning {
+                        origin: origin.to_string(),
+                        message: format!(
+                            "field 'last_used' should be RFC3339 UTC (YYYY-MM-DDTHH:MM:SSZ); ignoring {s:?}"
+                        ),
+                    });
+                    None
+                }
+            },
+        };
 
         let unknown_keys: Vec<(String, FmValue)> = doc
             .pairs
@@ -214,6 +259,8 @@ impl Memory {
                 core,
                 rationale,
                 scope,
+                confidence,
+                last_used,
                 unknown_keys,
                 body: doc.body.clone(),
             },
@@ -262,6 +309,18 @@ impl Memory {
         }
         if let Some(scope) = &self.scope {
             pairs.push(("scope".to_string(), FmValue::Scalar(scope.clone())));
+        }
+        if let Some(confidence) = self.confidence {
+            pairs.push((
+                "confidence".to_string(),
+                FmValue::Scalar(confidence.to_string()),
+            ));
+        }
+        if let Some(last_used) = self.last_used {
+            pairs.push((
+                "last_used".to_string(),
+                FmValue::Scalar(format_rfc3339_utc(last_used)),
+            ));
         }
         pairs.extend(self.unknown_keys.iter().cloned());
         FrontmatterDoc {
@@ -399,6 +458,8 @@ mod tests {
             core: None,
             rationale: None,
             scope: None,
+            confidence: None,
+            last_used: None,
             unknown_keys: vec![],
             body: String::new(),
         };
@@ -406,6 +467,41 @@ mod tests {
             m.to_doc().serialize(),
             "---\nid: rule-x-1\ntype: rule\ncreated: 1970-01-01T00:00:00Z\ntitle: T\n---\n"
         );
+    }
+
+    #[test]
+    fn lifecycle_fields_round_trip_and_are_backward_compatible() {
+        // Absent -> None (a pre-lifecycle file reads clean, no fields invented).
+        let bare = "---\nid: fact-x-1\ntype: fact\ncreated: 2026-07-13T12:00:00Z\ntitle: T\n---\n";
+        let (m, w) = Memory::from_doc(&doc(bare), "<t>").unwrap();
+        assert!(w.is_empty());
+        assert_eq!(m.confidence, None);
+        assert_eq!(m.last_used, None);
+        assert_eq!(
+            m.to_doc().serialize(),
+            bare,
+            "absent stays absent (no noise)"
+        );
+
+        // Present -> parsed, and emitted in schema order after scope.
+        let full = "---\nid: fact-x-1\ntype: fact\ncreated: 2026-07-13T12:00:00Z\ntitle: T\nconfidence: 500000\nlast_used: 2026-07-14T09:00:00Z\n---\nbody\n";
+        let (m, w) = Memory::from_doc(&doc(full), "<t>").unwrap();
+        assert!(w.is_empty());
+        assert_eq!(m.confidence, Some(500_000));
+        assert_eq!(
+            m.last_used,
+            Some(parse_rfc3339_utc("2026-07-14T09:00:00Z").unwrap())
+        );
+        assert_eq!(m.to_doc().serialize(), full, "canonical round trip");
+    }
+
+    #[test]
+    fn malformed_lifecycle_fields_warn_not_error() {
+        let text = "---\nid: fact-x-1\ntype: fact\ncreated: 2026-07-13T12:00:00Z\ntitle: T\nconfidence: lots\nlast_used: recently\n---\n";
+        let (m, w) = Memory::from_doc(&doc(text), "memories/x.md").unwrap();
+        assert_eq!(m.confidence, None, "unparseable confidence dropped");
+        assert_eq!(m.last_used, None, "unparseable last_used dropped");
+        assert_eq!(w.len(), 2, "both warned: {w:?}");
     }
 
     #[test]

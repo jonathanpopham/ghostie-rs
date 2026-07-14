@@ -58,6 +58,22 @@ pub struct RecallOpts {
     /// that share no whole token (`sovereign` -> `sovereignty`). On by default;
     /// the eval harness flips it off to measure the lift.
     pub rerank: bool,
+    /// Blend a confidence-decay prior into the ranking: memories untouched for a
+    /// long time sink a little, so a growing store does not flood recall with
+    /// stale cruft. OFF by default so the default output is byte-identical to a
+    /// no-decay build (the gate's goldens rely on that); `--decay` turns it on.
+    pub decay: bool,
+    /// Max score demotion (micro-units) a fully-decayed memory receives when
+    /// `decay` is on. Small by design: decay reorders near-ties, never
+    /// overpowers BM25 / embedding relevance.
+    pub decay_weight_micros: i64,
+    /// Confidence half-life in seconds for the decay prior.
+    pub half_life_secs: i64,
+    /// Query-time instant (epoch seconds) decay is measured against, taken from
+    /// the injected clock so recall stays deterministic under
+    /// `GHOSTIE_TEST_CLOCK`. `None` (the default) disables decay regardless of
+    /// the `decay` flag, so recall never depends on an ambient wall clock.
+    pub now_epoch: Option<i64>,
 }
 
 impl Default for RecallOpts {
@@ -71,6 +87,10 @@ impl Default for RecallOpts {
             budget_tokens: None,
             diversify: false,
             rerank: true,
+            decay: false,
+            decay_weight_micros: crate::decay::DEFAULT_DECAY_WEIGHT_MICROS,
+            half_life_secs: crate::decay::DEFAULT_HALF_LIFE_SECS,
+            now_epoch: None,
         }
     }
 }
@@ -558,6 +578,34 @@ pub fn recall(store: &Store, query: &str, opts: &RecallOpts) -> Result<RecallRes
         }
     }
 
+    // Confidence-decay prior (opt-in). A memory untouched for a long time is
+    // demoted a little; a fresh one is untouched. Deterministic: the reference
+    // clock is injected (`now_epoch`), the math is pure integer (`decay`), and
+    // when the flag is off (the default) NOTHING here runs, so the default
+    // output is byte-identical to a build without decay. The lifecycle fields
+    // are not in the derivable index, so we read them from the files — only on
+    // the handful of already-found hits, and only under `--decay`.
+    if opts.decay
+        && opts.decay_weight_micros > 0
+        && let Some(now) = opts.now_epoch
+    {
+        for h in &mut hits {
+            let (base, reference) = match store.read(&h.id) {
+                Ok((m, _)) => (
+                    m.confidence.unwrap_or(crate::decay::FULL_CONFIDENCE_MICROS),
+                    m.last_used.unwrap_or(m.created),
+                ),
+                Err(_) => (crate::decay::FULL_CONFIDENCE_MICROS, h.created),
+            };
+            let decayed =
+                crate::decay::decayed_confidence_micros(base, reference, now, opts.half_life_secs);
+            let deficit = crate::decay::FULL_CONFIDENCE_MICROS - decayed; // 0..=FULL
+            let penalty = opts.decay_weight_micros.saturating_mul(deficit)
+                / crate::decay::FULL_CONFIDENCE_MICROS;
+            h.score_micros = h.score_micros.saturating_sub(penalty);
+        }
+    }
+
     // Total order: score desc, id asc (stable, deterministic).
     hits.sort_by(|a, b| {
         b.score_micros
@@ -854,6 +902,64 @@ mod tests {
             diverse.hits.iter().any(|h| h.id == b),
             "the duplicate is demoted, not dropped"
         );
+    }
+
+    #[test]
+    fn decay_is_off_by_default_and_selective_when_on() {
+        let tmp = TempDir::new("recall-decay");
+        let store = Store::open(tmp.path());
+        seed(&store); // four memories, all created at T0
+        let q = "sync floats configs";
+        let base = recall(&store, q, &RecallOpts::default()).unwrap();
+        assert!(base.hits.len() >= 2);
+        let stale_id = base.hits[0].id.clone();
+        let fresh_id = base.hits[1].id.clone();
+        let base_stale = base.hits[0].score_micros;
+        let base_fresh = base.hits[1].score_micros;
+
+        // "now" is a year past creation: well over a 90-day half-life.
+        let now = T0 + 365 * 24 * 3600;
+        // Revalidate the second hit so it is fresh AS OF `now`.
+        store.mark_used(&fresh_id, &FixedClock(now)).unwrap();
+
+        // Default recall is byte-identical whether or not the decay code exists:
+        // the decay branch is gated off, so re-running proves no leak.
+        let base_again = recall(&store, q, &RecallOpts::default()).unwrap();
+        let re_fresh = base_again
+            .hits
+            .iter()
+            .find(|h| h.id == fresh_id)
+            .unwrap()
+            .score_micros;
+
+        let opts = RecallOpts {
+            decay: true,
+            now_epoch: Some(now),
+            ..RecallOpts::default()
+        };
+        let decayed = recall(&store, q, &opts).unwrap();
+        let d_stale = decayed
+            .hits
+            .iter()
+            .find(|h| h.id == stale_id)
+            .unwrap()
+            .score_micros;
+        let d_fresh = decayed
+            .hits
+            .iter()
+            .find(|h| h.id == fresh_id)
+            .unwrap()
+            .score_micros;
+
+        assert!(
+            d_stale < base_stale,
+            "a stale memory is demoted under --decay ({d_stale} < {base_stale})"
+        );
+        assert_eq!(
+            d_fresh, re_fresh,
+            "a just-revalidated memory keeps full confidence: no penalty"
+        );
+        let _ = base_fresh;
     }
 
     #[test]

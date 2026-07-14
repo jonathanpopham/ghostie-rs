@@ -204,6 +204,10 @@ fn robot_mode_contract_for_every_subcommand() {
             "remember" => vec!["remember", "--type", "fact", "robot audit memory"],
             "recall" => vec!["recall", "sync branch"],
             "list" => vec!["list"],
+            // No id + --json -> usage envelope (never deletes the audit store).
+            "forget" => vec!["forget"],
+            // Dry-run lists only; it never archives.
+            "prune" => vec!["prune", "--dry-run"],
             "capture" => vec!["capture", tpath],
             "sync" => vec!["sync"],
             "hook" => vec!["hook", "status"],
@@ -391,5 +395,157 @@ fn malformed_test_clock_is_a_hard_error_not_wall_time() {
         "{}",
         stderr(&o)
     );
+    let _ = std::fs::remove_dir_all(store);
+}
+
+// ---------- forget (lifecycle: ghostie-rs-3lf) ----------
+
+#[test]
+fn forget_deletes_with_force_and_reports_json() {
+    let store = temp_store("forget-force");
+    seed_five(&store);
+    let path = store.join("memories/fact-configs-live-in-etc-1.md");
+    assert!(path.exists(), "seeded memory present");
+    let o = ghostie(
+        &store,
+        &["forget", "fact-configs-live-in-etc-1", "--force", "--json"],
+    );
+    assert!(o.status.success(), "{}", stderr(&o));
+    let doc = json::parse(stdout(&o).trim_end()).unwrap();
+    assert_eq!(doc.get("ok").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        doc.get("data")
+            .and_then(|d| d.get("deleted"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(!path.exists(), "file is gone after forget --force");
+    let _ = std::fs::remove_dir_all(store);
+}
+
+#[test]
+fn forget_json_without_force_refuses() {
+    let store = temp_store("forget-refuse");
+    seed_five(&store);
+    let path = store.join("memories/fact-configs-live-in-etc-1.md");
+    let o = ghostie(&store, &["forget", "fact-configs-live-in-etc-1", "--json"]);
+    assert_eq!(o.status.code(), Some(2), "usage error: {}", stderr(&o));
+    let doc = json::parse(stdout(&o).trim_end()).unwrap();
+    assert_eq!(doc.get("ok").and_then(Value::as_bool), Some(false));
+    assert_eq!(
+        doc.get("error")
+            .and_then(|e| e.get("kind"))
+            .and_then(Value::as_str),
+        Some("usage")
+    );
+    assert!(path.exists(), "nothing deleted without --force");
+    let _ = std::fs::remove_dir_all(store);
+}
+
+#[test]
+fn forget_human_confirms_on_stdin() {
+    let store = temp_store("forget-confirm");
+    seed_five(&store);
+    let path = store.join("memories/fact-configs-live-in-etc-1.md");
+    // Declining leaves the file in place.
+    let o = ghostie_stdin(&store, &["forget", "fact-configs-live-in-etc-1"], "n\n");
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(stdout(&o).contains("aborted"), "{}", stdout(&o));
+    assert!(path.exists(), "declined confirmation keeps the file");
+    // Confirming with y deletes it.
+    let o = ghostie_stdin(&store, &["forget", "fact-configs-live-in-etc-1"], "y\n");
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(stdout(&o).contains("deleted"), "{}", stdout(&o));
+    assert!(!path.exists(), "confirmed deletion removes the file");
+    let _ = std::fs::remove_dir_all(store);
+}
+
+#[test]
+fn forget_missing_id_is_usage_error() {
+    let store = temp_store("forget-noid");
+    let o = ghostie(&store, &["forget", "--json"]);
+    assert_eq!(o.status.code(), Some(2));
+    let doc = json::parse(stdout(&o).trim_end()).unwrap();
+    assert_eq!(doc.get("command").and_then(Value::as_str), Some("forget"));
+    let _ = std::fs::remove_dir_all(store);
+}
+
+// ---------- prune (lifecycle: ghostie-rs-h5y) ----------
+
+#[test]
+fn prune_dry_run_lists_but_archives_nothing_then_force_archives() {
+    let store = temp_store("prune");
+    seed_five(&store);
+    // Age a memory so it decays below the floor: mark it used far in the past
+    // (via --touch under a past clock is awkward; instead hand-write an old
+    // last_used + low confidence, which the tolerant reader accepts).
+    let target = store.join("memories/fact-configs-live-in-etc-1.md");
+    let text = std::fs::read_to_string(&target).unwrap();
+    // Insert lifecycle fields before the closing delimiter of the frontmatter.
+    let doctored = text.replacen(
+        "\n---\n",
+        "\nconfidence: 1000000\nlast_used: 2000-01-01T00:00:00Z\n---\n",
+        1,
+    );
+    std::fs::write(&target, doctored).unwrap();
+
+    // Dry-run (default): lists the stale memory, archives nothing.
+    let o = ghostie(&store, &["prune", "--json"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let doc = json::parse(stdout(&o).trim_end()).unwrap();
+    assert_eq!(
+        doc.get("data")
+            .and_then(|d| d.get("dry_run"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    let count = doc
+        .get("data")
+        .and_then(|d| d.get("count"))
+        .and_then(Value::as_i64)
+        .unwrap();
+    assert!(
+        count >= 1,
+        "the aged memory is below the floor: {}",
+        stdout(&o)
+    );
+    assert!(target.exists(), "dry-run must not move any file");
+    assert!(
+        !store.join("archive").exists(),
+        "dry-run creates no archive dir"
+    );
+
+    // --force archives it.
+    let o = ghostie(&store, &["prune", "--force", "--json"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(
+        !target.exists(),
+        "forced prune moves the file out of memories/"
+    );
+    assert!(
+        store.join("archive/fact-configs-live-in-etc-1.md").exists(),
+        "archived file lands in <store>/archive/"
+    );
+    let _ = std::fs::remove_dir_all(store);
+}
+
+#[test]
+fn prune_leaves_a_fresh_store_untouched() {
+    let store = temp_store("prune-fresh");
+    seed_five(&store);
+    // All memories were created at the frozen clock == "now", so nothing has
+    // decayed; prune --force finds nothing to archive.
+    let o = ghostie(&store, &["prune", "--force", "--json"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let doc = json::parse(stdout(&o).trim_end()).unwrap();
+    assert_eq!(
+        doc.get("data")
+            .and_then(|d| d.get("count"))
+            .and_then(Value::as_i64),
+        Some(0),
+        "a fresh store has no stale memories: {}",
+        stdout(&o)
+    );
+    assert!(!store.join("archive").exists(), "nothing archived");
     let _ = std::fs::remove_dir_all(store);
 }

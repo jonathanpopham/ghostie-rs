@@ -18,7 +18,7 @@ use crate::error::{Error, Result};
 
 /// Canonical frontmatter key order per docs/FORMAT.md. Unknown keys follow,
 /// in first-seen order.
-pub const SCHEMA_KEY_ORDER: [&str; 12] = [
+pub const SCHEMA_KEY_ORDER: [&str; 14] = [
     "id",
     "type",
     "created",
@@ -31,6 +31,8 @@ pub const SCHEMA_KEY_ORDER: [&str; 12] = [
     "core",
     "rationale",
     "scope",
+    "confidence",
+    "last_used",
 ];
 
 /// A frontmatter value: bare/quoted scalar or inline list.

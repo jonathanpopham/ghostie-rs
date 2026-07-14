@@ -195,6 +195,10 @@ guard_robot_mode(){
       remember) out="$("$BIN" --store "$store" remember --type fact "robot probe" --json || true)" ;;
       recall)   out="$("$BIN" --store "$store" recall "probe" --json || true)" ;;
       list)     out="$("$BIN" --store "$store" list --json || true)" ;;
+      # No id -> usage envelope; the robot store is never touched (safe).
+      forget)   out="$("$BIN" --store "$store" forget --json || true)" ;;
+      # Dry-run lists only; it never archives, so the robot store is untouched.
+      prune)    out="$("$BIN" --store "$store" prune --dry-run --json || true)" ;;
       capture)  out="$("$BIN" --store "$store" capture "$store/t.jsonl" --json || true)" ;;
       sync)     out="$("$BIN" --store "$store" sync --json || true)" ;;
       hook)     out="$(HOME="$home" "$BIN" --store "$store" hook status --json || true)" ;;
