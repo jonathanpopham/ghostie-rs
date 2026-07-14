@@ -26,7 +26,7 @@ use crate::recall::{RecallOpts, recall};
 use crate::store::memory::MemoryType;
 use crate::store::{ListFilter, NewMemory, Store};
 use crate::util::{format_rfc3339_utc, resolve_clock};
-use crate::{capture, hook, sync};
+use crate::{capture, codex, hook, sync};
 use std::path::PathBuf;
 
 /// Subcommands implemented so far, in help order. The robot audit and the
@@ -369,11 +369,14 @@ EXIT CODES: 0 success · 1 failure · 2 bad arguments · 3 sync conflict
 
 const HELP_CAPTURE: &str = "\
 ghostie capture <transcript-path> [--format f] [--harness h] [--core c] [--scope s]
+ghostie capture --latest codex [--scope s]
 
   Distill an agent session log into memories: a session-summary carrying
   provenance, plus one memory for each `MEMORY <type>: text` marker in the
   transcript. Re-capturing the same session is idempotent.
 
+  --latest <h>    capture the newest rollout for harness <h> (codex) instead of
+                  a path: finds the most recent ~/.codex rollout itself
   --format <f>    auto (default) | claude-code | codex | generic
                   auto sniffs the file; generic reads ANY text/markdown, so a
                   harness without a bespoke parser still works via markers
@@ -383,6 +386,7 @@ ghostie capture <transcript-path> [--format f] [--harness h] [--core c] [--scope
 
 EXAMPLES
   ghostie capture ~/.codex/archived_sessions/rollout-*.jsonl
+  ghostie capture --latest codex
   ghostie capture ~/.hermes/notes.md --harness hermes --format generic
 
 EXIT CODES: 0 success · 1 failure · 2 bad arguments
@@ -407,12 +411,22 @@ ghostie hook <subcommand>
   install [--budget N] [--sync]   wire Claude Code to recall relevant memories
                                   on each prompt and capture (and optionally
                                   push) on session end; backs up settings first
-  status                          show whether the hooks are installed
-  uninstall                       remove ghostie's hooks, leave the rest
+  install --harness codex [--sync]
+                                  wire Codex: set its `notify` program in
+                                  ~/.codex/config.toml so each completed turn
+                                  captures the just-finished rollout; backs up
+                                  config first, and refuses to clobber a notify
+                                  you already have (prints the line to paste)
+  status [--harness codex]        show whether the hooks are installed
+  uninstall [--harness codex]     remove ghostie's hooks, leave the rest
   run recall [--budget N]         runner: reads the hook payload on stdin,
                                   emits injectable context (invoked by install)
   run capture [--sync]            runner: captures the transcript named in the
                                   payload, optionally syncs
+  run capture --codex-notify [--sync]
+                                  runner Codex calls: reads the notify event
+                                  (last argv arg) and captures the newest
+                                  ~/.codex rollout; idempotent per session
 
 EXIT CODES: 0 success · 1 failure · 2 bad arguments
 ";
@@ -968,9 +982,18 @@ fn cmd_capture(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk
     let mut core: Option<String> = None;
     let mut scope: Option<String> = None;
     let mut format: Option<capture::Format> = None;
+    let mut latest: Option<String> = None;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
+            "--latest" => {
+                i += 1;
+                latest = Some(
+                    rest.get(i)
+                        .ok_or_else(|| usage("--latest requires a harness (codex)".to_string()))?
+                        .clone(),
+                );
+            }
             "--harness" => {
                 i += 1;
                 harness = Some(
@@ -1015,7 +1038,35 @@ fn cmd_capture(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk
         }
         i += 1;
     }
-    let path = path.ok_or_else(|| usage("capture requires a transcript path".to_string()))?;
+    // `--latest <harness>` resolves the path from the harness's own logs (Codex
+    // notify carries no transcript path, so we find the newest rollout).
+    let (path, format, harness) = if let Some(h) = latest {
+        if path.is_some() {
+            return Err(usage(
+                "capture takes a path OR --latest, not both".to_string(),
+            ));
+        }
+        match h.as_str() {
+            "codex" => {
+                let home = codex::codex_home()?;
+                let found = codex::newest_rollout(&home).ok_or_else(|| Error::Invalid {
+                    origin: home.join("sessions").display().to_string(),
+                    message: "no Codex rollout (rollout-*.jsonl) found to capture".to_string(),
+                })?;
+                (
+                    found.display().to_string(),
+                    Some(capture::Format::Codex),
+                    Some(harness.unwrap_or_else(|| "codex".to_string())),
+                )
+            }
+            other => {
+                return Err(usage(format!("--latest supports 'codex' (got '{other}')")));
+            }
+        }
+    } else {
+        let path = path.ok_or_else(|| usage("capture requires a transcript path".to_string()))?;
+        (path, format, harness)
+    };
     let clock = resolve_clock()?;
     let created = capture::capture_file(
         store,
@@ -1102,8 +1153,26 @@ fn cmd_sync(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
     })
 }
 
+/// Read `--harness <value>` from a hook subcommand's args, defaulting to
+/// `claude-code`. Shared by status/uninstall so they can target Codex.
+fn harness_flag(rest: &[String], usage: &dyn Fn(String) -> Error) -> Result<String, Error> {
+    let mut i = 1;
+    while i < rest.len() {
+        if rest[i] == "--harness" {
+            i += 1;
+            return Ok(rest
+                .get(i)
+                .ok_or_else(|| usage("--harness requires a value".to_string()))?
+                .clone());
+        }
+        i += 1;
+    }
+    Ok("claude-code".to_string())
+}
+
 /// `hook run recall|capture` are the harness-invoked runners (payload on
-/// stdin); `hook install|status|uninstall` manage the Claude Code settings.
+/// stdin); `hook install|status|uninstall` manage the Claude Code settings or
+/// the Codex `notify` program (`--harness codex`).
 fn cmd_hook(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, Error> {
     let usage = |message: String| Error::Usage { message };
     let sub = rest.first().map(String::as_str).ok_or_else(|| {
@@ -1152,7 +1221,26 @@ fn cmd_hook(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
                 "capture" => {
                     let do_sync = rest.iter().any(|a| a == "--sync");
                     let clock = resolve_clock()?;
-                    let msg = hook::run_capture(store, &stdin, do_sync, clock.as_ref())?;
+                    // Codex path: no transcript in the event; find + capture the
+                    // newest rollout. Codex appends the event JSON as the last
+                    // argv arg, so it lands as a trailing positional here.
+                    let msg = if rest.iter().any(|a| a == "--codex-notify") {
+                        let notify_arg = rest
+                            .iter()
+                            .skip(2)
+                            .filter(|a| !a.starts_with("--"))
+                            .next_back()
+                            .map(String::as_str);
+                        hook::run_capture_codex_notify(
+                            store,
+                            notify_arg,
+                            &stdin,
+                            do_sync,
+                            clock.as_ref(),
+                        )?
+                    } else {
+                        hook::run_capture(store, &stdin, do_sync, clock.as_ref())?
+                    };
                     Ok(CmdOk {
                         data: Value::Object(vec![(
                             "status".to_string(),
@@ -1190,6 +1278,51 @@ fn cmd_hook(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
                     a => return Err(usage(format!("unknown flag '{a}' for hook install"))),
                 }
                 i += 1;
+            }
+            // Codex: auto-wire its `notify` program in ~/.codex/config.toml so
+            // each completed turn captures the just-finished rollout. If a
+            // foreign or multi-line notify is present we refuse to clobber it
+            // and hand back the exact line to paste.
+            if harness == "codex" {
+                let home = codex::codex_home()?;
+                let cfg = codex::config_path(&home);
+                let argv = codex::notify_argv(store.root(), do_sync);
+                let rep = codex::install_notify_at(&cfg, &argv)?;
+                let human = if rep.applied {
+                    format!(
+                        "installed Codex notify capture in {}{}\nstart a new Codex session to activate\n",
+                        rep.path.display(),
+                        if rep.backed_up {
+                            " (backup written)"
+                        } else {
+                            ""
+                        },
+                    )
+                } else {
+                    format!(
+                        "Codex already has a `notify` configured in {}; Codex allows only one.\n\
+                         Not overwriting it. To enable capture, merge this line yourself:\n  {}\n",
+                        rep.path.display(),
+                        rep.manual_line.clone().unwrap_or_default(),
+                    )
+                };
+                return Ok(CmdOk {
+                    data: Value::Object(vec![
+                        ("harness".to_string(), Value::string("codex")),
+                        (
+                            "config".to_string(),
+                            Value::string(rep.path.display().to_string()),
+                        ),
+                        ("applied".to_string(), Value::Bool(rep.applied)),
+                        ("backed_up".to_string(), Value::Bool(rep.backed_up)),
+                        (
+                            "notify_line".to_string(),
+                            Value::string(rep.manual_line.clone().unwrap_or_default()),
+                        ),
+                    ]),
+                    human,
+                    warnings: Vec::new(),
+                });
             }
             // Turnkey auto-wiring exists for Claude Code (its settings.json hook
             // schema is stable and verifiable). The runners themselves are
@@ -1253,6 +1386,26 @@ fn cmd_hook(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
             })
         }
         "status" => {
+            let harness = harness_flag(rest, &usage)?;
+            if harness == "codex" {
+                let cfg = codex::config_path(&codex::codex_home()?);
+                let on = codex::status_notify_at(&cfg);
+                return Ok(CmdOk {
+                    data: Value::Object(vec![
+                        ("harness".to_string(), Value::string("codex")),
+                        ("capture".to_string(), Value::Bool(on)),
+                        (
+                            "config".to_string(),
+                            Value::string(cfg.display().to_string()),
+                        ),
+                    ]),
+                    human: format!(
+                        "codex notify capture: {}\n",
+                        if on { "installed" } else { "not installed" }
+                    ),
+                    warnings: Vec::new(),
+                });
+            }
             let settings = hook::claude_settings_path()?;
             let (recall_on, capture_on) = hook::status_at(&settings)?;
             Ok(CmdOk {
@@ -1277,6 +1430,26 @@ fn cmd_hook(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
             })
         }
         "uninstall" => {
+            let harness = harness_flag(rest, &usage)?;
+            if harness == "codex" {
+                let cfg = codex::config_path(&codex::codex_home()?);
+                let removed = codex::uninstall_notify_at(&cfg)?;
+                return Ok(CmdOk {
+                    data: Value::Object(vec![
+                        ("harness".to_string(), Value::string("codex")),
+                        ("removed".to_string(), Value::Bool(removed)),
+                    ]),
+                    human: format!(
+                        "{}\n",
+                        if removed {
+                            "removed ghostie's Codex notify line"
+                        } else {
+                            "no ghostie Codex notify line to remove"
+                        }
+                    ),
+                    warnings: Vec::new(),
+                });
+            }
             let settings = hook::claude_settings_path()?;
             let removed = hook::uninstall_at(&settings)?;
             Ok(CmdOk {
