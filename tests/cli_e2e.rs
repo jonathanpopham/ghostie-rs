@@ -209,6 +209,7 @@ fn robot_mode_contract_for_every_subcommand() {
             // Dry-run lists only; it never archives.
             "prune" => vec!["prune", "--dry-run"],
             "capture" => vec!["capture", tpath],
+            "review" => vec!["review", "list"], // enumerate the pending queue
             "sync" => vec!["sync"],
             "hook" => vec!["hook", "status"],
             "mcp" => vec!["mcp"], // bare mcp prints the one-shot manifest (never `serve`)
@@ -254,6 +255,209 @@ fn robot_mode_contract_for_every_subcommand() {
         );
     }
     let _ = std::fs::remove_dir_all(store);
+}
+
+// ---------- review: the trust / approval gate ----------
+
+#[test]
+fn review_gate_capture_pending_then_approve_promotes() {
+    let store = temp_store("review-gate");
+    // A transcript with an explicit marker so capture yields a candidate.
+    let transcript = store.join("session.md");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        &transcript,
+        "MEMORY fact: pending candidate worth keeping\n",
+    )
+    .unwrap();
+    let tpath = transcript.to_str().unwrap();
+
+    // Capture with --pending: nothing lands live.
+    let o = ghostie(&store, &["capture", tpath, "--pending", "--json"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let doc = json::parse(stdout(&o).trim_end()).unwrap();
+    assert_eq!(
+        doc.get("data")
+            .and_then(|d| d.get("pending"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    let o = ghostie(&store, &["list", "--json"]);
+    let doc = json::parse(stdout(&o).trim_end()).unwrap();
+    assert_eq!(
+        doc.get("data")
+            .and_then(|d| d.get("count"))
+            .and_then(Value::as_i64),
+        Some(0),
+        "capture --pending must not touch live memory"
+    );
+
+    // review list shows the candidates.
+    let o = ghostie(&store, &["review", "list", "--json"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let doc = json::parse(stdout(&o).trim_end()).unwrap();
+    let pending = doc
+        .get("data")
+        .and_then(|d| d.get("pending"))
+        .and_then(Value::as_array)
+        .unwrap();
+    assert!(!pending.is_empty(), "candidate is listed for review");
+
+    // Approve all -> they become live.
+    let o = ghostie(&store, &["review", "approve", "--all", "--json"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let doc = json::parse(stdout(&o).trim_end()).unwrap();
+    assert!(
+        doc.get("data")
+            .and_then(|d| d.get("count"))
+            .and_then(Value::as_i64)
+            .unwrap()
+            >= 1
+    );
+    let o = ghostie(&store, &["list", "--json"]);
+    let doc = json::parse(stdout(&o).trim_end()).unwrap();
+    assert!(
+        doc.get("data")
+            .and_then(|d| d.get("count"))
+            .and_then(Value::as_i64)
+            .unwrap()
+            >= 1,
+        "approved candidates are now live memory"
+    );
+    // Pending queue is empty afterwards.
+    let o = ghostie(&store, &["review", "list", "--json"]);
+    let doc = json::parse(stdout(&o).trim_end()).unwrap();
+    assert_eq!(
+        doc.get("data")
+            .and_then(|d| d.get("pending"))
+            .and_then(Value::as_array)
+            .unwrap()
+            .len(),
+        0,
+        "approval clears the pending queue"
+    );
+    let _ = std::fs::remove_dir_all(store);
+}
+
+#[test]
+fn review_reject_drops_without_promoting() {
+    let store = temp_store("review-reject");
+    let transcript = store.join("s.md");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(&transcript, "MEMORY rule: candidate to reject\n").unwrap();
+    let tpath = transcript.to_str().unwrap();
+    ghostie(&store, &["capture", tpath, "--pending"]);
+    let o = ghostie(&store, &["review", "reject", "--all", "--json"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    // Nothing live, nothing pending.
+    let o = ghostie(&store, &["list", "--json"]);
+    let doc = json::parse(stdout(&o).trim_end()).unwrap();
+    assert_eq!(
+        doc.get("data")
+            .and_then(|d| d.get("count"))
+            .and_then(Value::as_i64),
+        Some(0)
+    );
+    let _ = std::fs::remove_dir_all(store);
+}
+
+// ---------- encrypted remote (guarded by gpg + git) ----------
+
+fn tool_on_path(bin: &str) -> bool {
+    Command::new(bin)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[test]
+fn encrypted_sync_round_trips_between_two_devices_via_cli() {
+    if !tool_on_path("git") || !tool_on_path("gpg") {
+        eprintln!("SKIP: git or gpg not available");
+        return;
+    }
+    let remote = temp_store("enc-cli-remote");
+    std::fs::create_dir_all(&remote).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let remote_url = remote.to_str().unwrap();
+    let pass = "cli-encrypted-sync-pass";
+    // gpg's agent socket lives under GNUPGHOME; the long macOS temp path used
+    // for HOME here overflows the ~104-char Unix socket limit, so point gpg at a
+    // short GNUPGHOME. Real users run under a short `~/.gnupg` and never hit this.
+    let gpghome = PathBuf::from(format!("/tmp/ghostie-gpg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&gpghome);
+
+    let enc = |store: &PathBuf, args: &[&str]| -> Output {
+        Command::new(BIN)
+            .env("GHOSTIE_TEST_CLOCK", CLOCK)
+            .env_remove("GHOSTIE_HOME")
+            .env("HOME", store)
+            .env("GNUPGHOME", &gpghome)
+            .env("GHOSTIE_GPG_PASSPHRASE", pass)
+            .arg("--store")
+            .arg(store)
+            .args(args)
+            .output()
+            .expect("binary runs")
+    };
+
+    // Device A: remember, init encrypted mirror, encrypted-sync push.
+    let a = temp_store("enc-cli-a");
+    let o = enc(&a, &["remember", "--type", "fact", "an encrypted secret"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let o = enc(&a, &["sync", "--encrypt", "--init", remote_url]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let o = enc(&a, &["sync", "--encrypt", "--json"]);
+    assert!(o.status.success(), "{} {}", stdout(&o), stderr(&o));
+    let doc = json::parse(stdout(&o).trim_end()).unwrap();
+    assert!(
+        doc.get("data")
+            .and_then(|d| d.get("pushed"))
+            .and_then(Value::as_bool)
+            == Some(true)
+    );
+
+    // Device B: init against the same encrypted remote, encrypted-sync -> restore.
+    let b = temp_store("enc-cli-b");
+    let o = enc(&b, &["sync", "--encrypt", "--init", remote_url]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let o = enc(&b, &["sync", "--encrypt", "--json"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let doc = json::parse(stdout(&o).trim_end()).unwrap();
+    assert!(
+        doc.get("data")
+            .and_then(|d| d.get("decrypted"))
+            .and_then(Value::as_i64)
+            .unwrap()
+            >= 1,
+        "device B decrypted the memory from ciphertext"
+    );
+    let o = ghostie(&b, &["list", "--json"]);
+    let doc = json::parse(stdout(&o).trim_end()).unwrap();
+    let mems = doc
+        .get("data")
+        .and_then(|d| d.get("memories"))
+        .and_then(Value::as_array)
+        .unwrap();
+    assert!(
+        mems.iter()
+            .any(|m| m.get("title").and_then(Value::as_str) == Some("an encrypted secret")),
+        "the encrypted memory decrypted onto device B"
+    );
+    let _ = std::fs::remove_dir_all(a);
+    let _ = std::fs::remove_dir_all(b);
+    let _ = std::fs::remove_dir_all(remote);
+    let _ = std::fs::remove_dir_all(&gpghome);
 }
 
 // ---------- process-level byte-stability ----------

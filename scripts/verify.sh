@@ -200,6 +200,8 @@ guard_robot_mode(){
       # Dry-run lists only; it never archives, so the robot store is untouched.
       prune)    out="$("$BIN" --store "$store" prune --dry-run --json || true)" ;;
       capture)  out="$("$BIN" --store "$store" capture "$store/t.jsonl" --json || true)" ;;
+      # `review list` enumerates the pending queue (empty here); safe, no ~/.claude.
+      review)   out="$("$BIN" --store "$store" review list --json || true)" ;;
       sync)     out="$("$BIN" --store "$store" sync --json || true)" ;;
       hook)     out="$(HOME="$home" "$BIN" --store "$store" hook status --json || true)" ;;
       # Bare `mcp` prints a one-shot manifest and exits; NEVER `mcp serve`,

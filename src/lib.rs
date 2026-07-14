@@ -15,6 +15,7 @@
 pub mod capture;
 pub mod cli;
 pub mod codex;
+pub mod crypt;
 pub mod decay;
 pub mod distill;
 mod error;
@@ -24,6 +25,7 @@ pub mod mcp;
 pub mod provenance;
 pub mod recall;
 pub mod redact;
+pub mod review;
 pub mod store;
 pub mod sync;
 pub mod util;

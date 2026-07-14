@@ -103,6 +103,7 @@ pub fn run_capture(
     stdin: &str,
     do_sync: bool,
     distill: bool,
+    pending: bool,
     clock: &dyn Clock,
 ) -> Result<String> {
     let v = json::parse(stdin.trim()).unwrap_or(Value::Null);
@@ -110,6 +111,15 @@ pub fn run_capture(
         return Ok("ghostie: no transcript_path in payload; nothing captured".to_string());
     };
     let scope = scope_from_cwd(v.get("cwd").and_then(Value::as_str));
+    // Trust gate: with --pending, capture into <store>/.pending for review, and
+    // never sync (candidates are not memory until approved).
+    let pending_store;
+    let target: &Store = if pending {
+        pending_store = crate::review::pending_store(store);
+        &pending_store
+    } else {
+        store
+    };
     // Auto-detect the format (a Claude Code SessionEnd transcript detects as
     // claude-code and stamps that harness).
     let created = if distill {
@@ -117,7 +127,7 @@ pub fn run_capture(
         // pure); a `--features distill` build may shell to the configured agent.
         let distiller = crate::distill::build_distiller(None);
         capture::capture_file_with_distill(
-            store,
+            target,
             path,
             None,
             None,
@@ -127,8 +137,14 @@ pub fn run_capture(
             clock,
         )?
     } else {
-        capture::capture_file(store, path, None, None, None, scope.as_deref(), clock)?
+        capture::capture_file(target, path, None, None, None, scope.as_deref(), clock)?
     };
+    if pending {
+        return Ok(format!(
+            "ghostie: captured {} candidate(s) to the review queue",
+            created.len()
+        ));
+    }
     let mut msg = format!("ghostie: captured {} memory(ies)", created.len());
     if do_sync && sync::git_available() {
         match sync::sync(store, clock) {
@@ -239,16 +255,21 @@ fn recall_command(store_root: &Path, budget: usize) -> String {
     )
 }
 
-fn capture_command(store_root: &Path, do_sync: bool, distill: bool) -> String {
+fn capture_command(store_root: &Path, do_sync: bool, distill: bool, review: bool) -> String {
     let mut c = format!(
         "ghostie --store {} hook run capture",
         sh_quote(&store_root.display().to_string())
     );
-    if do_sync {
+    // The trust gate wins over sync: pending candidates never sync until
+    // approved, so --pending suppresses --sync on the wired command.
+    if do_sync && !review {
         c.push_str(" --sync");
     }
     if distill {
         c.push_str(" --distill");
+    }
+    if review {
+        c.push_str(" --pending");
     }
     c
 }
@@ -369,6 +390,7 @@ pub fn install_at(
     budget: usize,
     do_sync: bool,
     distill: bool,
+    review: bool,
 ) -> Result<InstallReport> {
     let (raw, mut top) = load_settings(settings_path)?;
     let hooks = ensure_object(&mut top, "hooks");
@@ -381,7 +403,7 @@ pub fn install_at(
     upsert_hook(
         hooks,
         "SessionEnd",
-        &capture_command(store_root, do_sync, distill),
+        &capture_command(store_root, do_sync, distill, review),
         CAPTURE_TAIL,
     );
 
@@ -520,7 +542,7 @@ mod tests {
         )
         .unwrap();
         let stdin = format!(r#"{{"transcript_path":"{}"}}"#, transcript.display());
-        let msg = run_capture(&store, &stdin, false, false, &FixedClock(T0)).unwrap();
+        let msg = run_capture(&store, &stdin, false, false, false, &FixedClock(T0)).unwrap();
         assert!(msg.contains("captured 1"), "{msg}");
         let (mems, _) = store.list(&crate::store::ListFilter::default()).unwrap();
         assert_eq!(mems.len(), 1);
@@ -540,7 +562,7 @@ mod tests {
         .unwrap();
         let stdin = format!(r#"{{"transcript_path":"{}"}}"#, transcript.display());
         // distill on -> summary + a distilled decision (feature-off heuristic).
-        let msg = run_capture(&store, &stdin, false, true, &FixedClock(T0)).unwrap();
+        let msg = run_capture(&store, &stdin, false, true, false, &FixedClock(T0)).unwrap();
         assert!(msg.contains("captured 2"), "{msg}");
         let (mems, _) = store.list(&crate::store::ListFilter::default()).unwrap();
         assert!(mems.iter().any(|m| m.mtype == MemoryType::Decision));
@@ -559,7 +581,7 @@ mod tests {
         .unwrap();
 
         let store_root = tmp.path().join("store");
-        let rep = install_at(&settings, &store_root, 800, true, false).unwrap();
+        let rep = install_at(&settings, &store_root, 800, true, false, false).unwrap();
         assert!(rep.backed_up, "existing settings backed up");
         assert!(settings.with_extension("json.ghostie-bak").exists());
 
@@ -575,7 +597,7 @@ mod tests {
         assert!(text.contains("hook run capture --sync"));
 
         // Idempotent: installing again does not duplicate entries.
-        install_at(&settings, &store_root, 800, true, false).unwrap();
+        install_at(&settings, &store_root, 800, true, false, false).unwrap();
         let v = json::parse(std::fs::read_to_string(&settings).unwrap().trim()).unwrap();
         let ups = v
             .get("hooks")
