@@ -11,7 +11,7 @@ repository = "https://github.com/jonathanpopham/ghostie-rs"
 # Optional, deliberately-impure model-driven distillation for `capture`. OFF by
 # default so the shipped build stays airgap-pure and zero-dependency; the empty
 # feature list keeps [dependencies] empty (the gate greps for that). When on,
-# capture may shell out to an external agent CLI (a tool, not a crate) — exactly
-# as sync shells to `git` — and falls back to the std-only heuristic distiller.
+# capture may shell out to an external agent CLI (a tool, not a crate), exactly
+# as sync shells to `git`, and falls back to the std-only heuristic distiller.
 [features]
 distill = []
