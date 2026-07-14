@@ -18,6 +18,7 @@ mod error;
 pub mod hook;
 pub mod json;
 pub mod recall;
+pub mod redact;
 pub mod store;
 pub mod sync;
 pub mod util;

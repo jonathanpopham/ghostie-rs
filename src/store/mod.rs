@@ -18,6 +18,7 @@ pub mod memory;
 use crate::error::{Error, Result, Warning};
 use crate::store::memory::{Memory, MemoryType};
 use crate::util::Clock;
+use std::cell::Cell;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
@@ -35,6 +36,19 @@ fn sanitize_scalar(s: &str) -> String {
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     cleaned.trim().to_string()
+}
+
+/// Redact secrets from a frontmatter scalar, then sanitize it. Redaction runs
+/// FIRST so a leaked key is scrubbed to `[REDACTED:...]` before control-char
+/// stripping and trimming collapse the one-line grammar. A no-op when
+/// `redact` is off (the `--no-redact` escape hatch).
+fn redact_scalar(s: &str, redact: bool) -> String {
+    let scrubbed = if redact {
+        crate::redact::redact(s).0
+    } else {
+        s.to_string()
+    };
+    sanitize_scalar(&scrubbed)
 }
 
 /// On Unix, memory files and the store directory hold prompts, decisions, and
@@ -89,13 +103,33 @@ pub struct ListFilter {
 /// A memory store bound to a root directory.
 pub struct Store {
     root: PathBuf,
+    /// Whether the write path scrubs secrets before persisting (default on).
+    /// A `Cell` so the CLI can flip it via `&Store` for the `--no-redact`
+    /// escape hatch; the store is only ever used single-threaded.
+    redact: Cell<bool>,
 }
 
 impl Store {
     /// Bind to a root directory. No I/O happens until an operation runs;
-    /// write operations create `<root>/memories/` on demand.
+    /// write operations create `<root>/memories/` on demand. Secret redaction
+    /// on the write path is ON by default.
     pub fn open(root: impl Into<PathBuf>) -> Store {
-        Store { root: root.into() }
+        Store {
+            root: root.into(),
+            redact: Cell::new(true),
+        }
+    }
+
+    /// Turn the write-path secret redaction gate on or off. Off is the
+    /// intentional `--no-redact` escape hatch for the rare case where the
+    /// content genuinely must be stored verbatim.
+    pub fn set_redaction(&self, on: bool) {
+        self.redact.set(on);
+    }
+
+    /// Whether the write path currently scrubs secrets.
+    pub fn redaction_enabled(&self) -> bool {
+        self.redact.get()
     }
 
     /// The store root.
@@ -119,7 +153,11 @@ impl Store {
         let mtype = new.mtype.ok_or_else(|| Error::Usage {
             message: "memory type is required".to_string(),
         })?;
-        let title = sanitize_scalar(&new.title);
+        // Redact BEFORE slugifying: the slug becomes the filename and the
+        // frontmatter id, both of which sync to the remote. A secret in the
+        // title must not survive into the id (build_memory scrubs the stored
+        // title too; re-redaction is idempotent).
+        let title = redact_scalar(&new.title, self.redact.get());
         if title.is_empty() {
             return Err(Error::Usage {
                 message: "title must not be empty".to_string(),
@@ -138,7 +176,7 @@ impl Store {
             }
             n += 1;
         };
-        let memory = Self::build_memory(id, mtype, new, clock);
+        let memory = self.build_memory(id, mtype, new, clock);
         self.write_atomic(&memory)?;
         self.refresh_index_best_effort();
         Ok(memory)
@@ -161,16 +199,41 @@ impl Store {
         if !self.try_reserve(id)? {
             return Ok(None);
         }
-        let memory = Self::build_memory(id.to_string(), mtype, new, clock);
+        let memory = self.build_memory(id.to_string(), mtype, new, clock);
         self.write_atomic(&memory)?;
         self.refresh_index_best_effort();
         Ok(Some(memory))
     }
 
     /// Build a validated in-memory `Memory`, sanitizing every frontmatter
-    /// scalar (control characters would corrupt the one-line grammar).
-    fn build_memory(id: String, mtype: MemoryType, new: &NewMemory, clock: &dyn Clock) -> Memory {
-        let opt = |o: &Option<String>| {
+    /// scalar (control characters would corrupt the one-line grammar) and, when
+    /// redaction is enabled (the default), scrubbing secrets from the free-text
+    /// fields BEFORE they are persisted. This is the single write-path choke
+    /// point: both [`Store::create`] (used by `remember`) and
+    /// [`Store::create_with_id`] (used by `capture` for the session summary and
+    /// every marker) route through here, so nothing containing a detectable key
+    /// or token can reach disk or sync to a git remote. Redaction covers the
+    /// free-text fields that ingest arbitrary content — `title`, `tags`,
+    /// `source`, `rationale`, and the Markdown `body`. The structured
+    /// provenance fields (`harness`, `core`, `scope`, `supersedes`) are
+    /// sanitized only: they hold model/harness/scope/id tokens, not user text,
+    /// and redacting them risks mangling a legitimate value for no benefit.
+    fn build_memory(
+        &self,
+        id: String,
+        mtype: MemoryType,
+        new: &NewMemory,
+        clock: &dyn Clock,
+    ) -> Memory {
+        let on = self.redact.get();
+        // Free-text fields: redact then sanitize.
+        let opt_red = |o: &Option<String>| {
+            o.as_ref()
+                .map(|s| redact_scalar(s, on))
+                .filter(|s| !s.is_empty())
+        };
+        // Structured provenance: sanitize only.
+        let opt_plain = |o: &Option<String>| {
             o.as_ref()
                 .map(|s| sanitize_scalar(s))
                 .filter(|s| !s.is_empty())
@@ -179,22 +242,26 @@ impl Store {
             id,
             mtype,
             created: clock.now_epoch_seconds(),
-            title: sanitize_scalar(&new.title),
+            title: redact_scalar(&new.title, on),
             tags: new
                 .tags
                 .iter()
-                .map(|t| sanitize_scalar(t))
+                .map(|t| redact_scalar(t, on))
                 .filter(|t| !t.is_empty())
                 .collect(),
             links: new.links.clone(),
-            source: opt(&new.source),
-            supersedes: opt(&new.supersedes),
-            harness: opt(&new.harness),
-            core: opt(&new.core),
-            rationale: opt(&new.rationale),
-            scope: opt(&new.scope),
+            source: opt_red(&new.source),
+            supersedes: opt_plain(&new.supersedes),
+            harness: opt_plain(&new.harness),
+            core: opt_plain(&new.core),
+            rationale: opt_red(&new.rationale),
+            scope: opt_plain(&new.scope),
             unknown_keys: Vec::new(),
-            body: new.body.clone(),
+            body: if on {
+                crate::redact::redact(&new.body).0
+            } else {
+                new.body.clone()
+            },
         }
     }
 
@@ -742,6 +809,52 @@ mod tests {
         assert!(long.len() <= 40, "capped: {long} ({} chars)", long.len());
         assert!(!long.ends_with('-'), "never ends in hyphen: {long}");
         assert_eq!(slugify("CamelCase123"), "camelcase123");
+    }
+
+    #[test]
+    fn write_path_redacts_secrets_by_default() {
+        let tmp = TempDir::new("redact-on");
+        let store = Store::open(tmp.path());
+        assert!(store.redaction_enabled(), "on by default");
+        let fake = format!("token {} here", "ghp_".to_string() + &"x".repeat(36));
+        let m = store
+            .create(
+                &NewMemory {
+                    mtype: Some(MemoryType::Fact),
+                    title: "a note".to_string(),
+                    body: fake.clone(),
+                    ..NewMemory::default()
+                },
+                &FixedClock(T0),
+            )
+            .unwrap();
+        let text =
+            std::fs::read_to_string(store.memories_dir().join(format!("{}.md", m.id))).unwrap();
+        assert!(!text.contains("ghp_"), "secret must not reach disk: {text}");
+        assert!(text.contains("[REDACTED:github-token]"), "{text}");
+    }
+
+    #[test]
+    fn no_redact_escape_hatch_preserves_content() {
+        let tmp = TempDir::new("redact-off");
+        let store = Store::open(tmp.path());
+        store.set_redaction(false);
+        assert!(!store.redaction_enabled());
+        let fake = "AKIAIOSFODNN7EXAMPLE".to_string();
+        let m = store
+            .create(
+                &NewMemory {
+                    mtype: Some(MemoryType::Fact),
+                    title: "verbatim".to_string(),
+                    body: fake.clone(),
+                    ..NewMemory::default()
+                },
+                &FixedClock(T0),
+            )
+            .unwrap();
+        let text =
+            std::fs::read_to_string(store.memories_dir().join(format!("{}.md", m.id))).unwrap();
+        assert!(text.contains(&fake), "verbatim with --no-redact: {text}");
     }
 
     #[test]
