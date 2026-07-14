@@ -393,14 +393,28 @@ fn scan_markers(text: &str) -> Vec<(MemoryType, String)> {
 /// the summary. Returns the created memories in creation order.
 pub fn capture(store: &Store, rec: &SessionRecord, clock: &dyn Clock) -> Result<Vec<Memory>> {
     let mut created = Vec::new();
+    // Scrub secrets from any content that flows into an id/slug BEFORE it is
+    // slugified: the id is both the filename and the frontmatter id, both of
+    // which sync to the remote, and `create_with_id` takes the id verbatim
+    // (unlike `create`, it does not recompute the slug). The stored title/body
+    // are scrubbed again in `build_memory`; re-redaction is idempotent. Honors
+    // the store's `--no-redact` toggle.
+    let scrub = |s: &str| {
+        if store.redaction_enabled() {
+            crate::redact::redact(s).0
+        } else {
+            s.to_string()
+        }
+    };
     let session_id = rec
         .session_id
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
-    let title = rec
-        .task
-        .clone()
-        .unwrap_or_else(|| "agent session".to_string());
+    let title = scrub(
+        &rec.task
+            .clone()
+            .unwrap_or_else(|| "agent session".to_string()),
+    );
     let body = format!(
         "Session on {}{}. {} message(s).{}\n",
         rec.harness,
@@ -445,18 +459,19 @@ pub fn capture(store: &Store, rec: &SessionRecord, clock: &dyn Clock) -> Result<
     created.push(summary);
 
     for (mtype, text) in &rec.markers {
+        let text = scrub(text);
         let mhash = crate::util::fnv1a64_hex(format!("{summary_id}:{text}").as_bytes());
         let marker_id = format!(
             "{}-{}-{}",
             mtype.as_str(),
-            crate::store::slugify(text),
+            crate::store::slugify(&text),
             &mhash[..8]
         );
         if let Some(m) = store.create_with_id(
             &marker_id,
             &NewMemory {
                 mtype: Some(*mtype),
-                title: cap_chars(text, 100),
+                title: cap_chars(&text, 100),
                 harness: Some(rec.harness.clone()),
                 core: rec.core.clone(),
                 scope: rec.scope.clone(),
@@ -617,6 +632,44 @@ mod tests {
         let ia: Vec<_> = ca.iter().map(|m| &m.id).collect();
         let ib: Vec<_> = cb.iter().map(|m| &m.id).collect();
         assert_eq!(ia, ib);
+    }
+
+    #[test]
+    fn captured_secret_is_redacted_before_it_reaches_disk() {
+        // A transcript whose marker body echoes a fake GitHub token. After
+        // capture, no stored memory file may contain the token; each must show
+        // the redaction marker instead. Fake, obviously-non-real secret.
+        let tmp = TempDir::new("capture-redact");
+        let store = Store::open(tmp.path());
+        let fake = format!("ghp_{}", "x".repeat(36));
+        let transcript = format!("MEMORY fact: the leaked key was {fake} do not reuse it");
+        let rec = parse(&transcript, Format::Generic, Some("hermes"), None);
+        let created = capture(&store, &rec, &FixedClock(T0)).unwrap();
+        assert!(!created.is_empty());
+        for m in &created {
+            let path = store.memories_dir().join(format!("{}.md", m.id));
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !text.contains("ghp_"),
+                "secret leaked into {}: {text}",
+                m.id
+            );
+        }
+        // The marker memory carries the redaction marker in title and body.
+        let marker = created
+            .iter()
+            .find(|m| m.mtype == MemoryType::Fact)
+            .expect("a fact marker was created");
+        assert!(
+            marker.body.contains("[REDACTED:github-token]"),
+            "{:?}",
+            marker.body
+        );
+        assert!(
+            marker.title.contains("[REDACTED:github-token]"),
+            "{:?}",
+            marker.title
+        );
     }
 
     #[test]

@@ -303,6 +303,7 @@ ghostie remember --type fact|decision|rule \"title\" [options]
   --harness <h>    provenance: where it was made (claude-code | hermes | codex)
   --core <m>       provenance: which model produced it (opus-4.8 | hermes-4-405b)
   --scope <s>      global (default) | project:<name>, to keep recall focused
+  --no-redact      store content verbatim; skip the default secret scrubbing
 
 EXAMPLES
   ghostie remember --type rule \"Always run verify.sh before commit\" --tags ci
@@ -383,6 +384,11 @@ ghostie capture --latest codex [--scope s]
   --harness <h>   override the recorded harness (claude-code | codex | hermes)
   --core <c>      override the recorded model
   --scope <s>     stamp a retrieval scope (global | project:<name>)
+  --no-redact     ingest verbatim; skip the default secret scrubbing
+
+  By default capture scrubs detected secrets (API keys, tokens, private keys)
+  from ingested content before it is written, so a transcript that echoed a key
+  never lands in a memory file or syncs to your remote.
 
 EXAMPLES
   ghostie capture ~/.codex/archived_sessions/rollout-*.jsonl
@@ -546,9 +552,13 @@ fn cmd_remember(
     let mut core: Option<String> = None;
     let mut rationale: Option<String> = None;
     let mut scope: Option<String> = None;
+    let mut no_redact = false;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
+            // Escape hatch: store content verbatim, skipping the secret
+            // redaction that guards the write path by default.
+            "--no-redact" => no_redact = true,
             "--type" => {
                 i += 1;
                 let v = rest
@@ -683,6 +693,9 @@ fn cmd_remember(
         return Err(usage("title must not be empty".to_string()));
     }
     let clock = resolve_clock()?;
+    if no_redact {
+        store.set_redaction(false);
+    }
     let memory = store.create(
         &NewMemory {
             mtype: Some(mtype),
@@ -983,6 +996,7 @@ fn cmd_capture(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk
     let mut scope: Option<String> = None;
     let mut format: Option<capture::Format> = None;
     let mut latest: Option<String> = None;
+    let mut no_redact = false;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -994,6 +1008,9 @@ fn cmd_capture(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk
                         .clone(),
                 );
             }
+            // Escape hatch: ingest the transcript verbatim, skipping the
+            // default secret redaction on the write path.
+            "--no-redact" => no_redact = true,
             "--harness" => {
                 i += 1;
                 harness = Some(
@@ -1068,6 +1085,9 @@ fn cmd_capture(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk
         (path, format, harness)
     };
     let clock = resolve_clock()?;
+    if no_redact {
+        store.set_redaction(false);
+    }
     let created = capture::capture_file(
         store,
         &path,

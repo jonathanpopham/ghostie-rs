@@ -116,6 +116,32 @@ Point your client's MCP config at the `ghostie` binary. For a client that reads
 and the tool list); `ghostie mcp --json` emits it as a single JSON envelope, so
 a tool can discover the surface without starting the server.
 
+## Secret-redaction gate
+
+Because your memory syncs to your own git remote, nothing secret should ever
+land in a memory file. Every write runs through a deterministic, std-only
+redaction pass first: it scans the free-text fields (title, tags, rationale,
+source, and the body) and replaces anything shaped like a credential with
+`[REDACTED:<kind>]`. This matters most for `capture`, which ingests arbitrary
+agent transcripts that routinely echo API keys and tokens.
+
+The scan is a small hand-rolled matcher (no regex crate) covering AWS access
+key ids, GitHub tokens, OpenAI/Anthropic keys, Slack tokens, Google API keys,
+`Bearer` / `Authorization:` credentials, PEM private-key blocks, and
+`password=` / `token=` / `secret=` style assignments. It is deliberately
+conservative: every matcher keys off a specific vendor prefix or an explicit
+assignment context, and there is no blunt "long random string" rule. The
+tradeoff is precision over recall. Ordinary prose, memory ids like
+`rule-foo-1`, short git shas, and plain URLs are never mangled; the cost is
+that a bare, prefixless secret can slip through. A false positive silently
+corrupts your own memory, so the gate errs toward leaving text alone.
+
+Redaction runs at a single choke point (`Store::build_memory`), so both
+`remember` and `capture` are covered and the scrubbed bytes are what get
+written and synced. It is deterministic and byte-stable: the same input always
+produces the same output. For the rare case where content must be stored
+verbatim, `remember --no-redact` and `capture --no-redact` turn the gate off.
+
 ## CI
 
 `scripts/verify.sh` is the gate: fmt, clippy (deny warnings), build, test,
