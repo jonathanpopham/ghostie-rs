@@ -77,6 +77,79 @@ pub struct SessionRecord {
     pub markers: Vec<(MemoryType, String)>,
 }
 
+impl SessionRecord {
+    /// Canonical, provider-agnostic JSON form of a parsed session: fixed key
+    /// order, integers and strings only, deterministic. This is the unified
+    /// record any harness parser produces, so a session captured in one tool
+    /// can be inspected, moved, or replayed without re-parsing its native log.
+    pub fn to_json(&self) -> Value {
+        let opt = |o: &Option<String>| match o {
+            Some(s) => Value::string(s.clone()),
+            None => Value::Null,
+        };
+        Value::Object(vec![
+            ("harness".to_string(), Value::string(self.harness.clone())),
+            ("core".to_string(), opt(&self.core)),
+            ("session_id".to_string(), opt(&self.session_id)),
+            ("task".to_string(), opt(&self.task)),
+            (
+                "message_count".to_string(),
+                Value::int(self.message_count as i64),
+            ),
+            ("scope".to_string(), opt(&self.scope)),
+            (
+                "markers".to_string(),
+                Value::Array(
+                    self.markers
+                        .iter()
+                        .map(|(ty, text)| {
+                            Value::Object(vec![
+                                ("type".to_string(), Value::string(ty.as_str())),
+                                ("text".to_string(), Value::string(text.clone())),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+        ])
+    }
+
+    /// Parse the canonical JSON form. Tolerant: missing fields take their
+    /// defaults, and a marker whose `type` is unknown is skipped.
+    pub fn from_json(v: &Value) -> SessionRecord {
+        let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+        let markers = v
+            .get("markers")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| {
+                        let ty = m
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .and_then(MemoryType::parse)?;
+                        let text = m.get("text").and_then(Value::as_str)?.to_string();
+                        Some((ty, text))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        SessionRecord {
+            harness: s("harness").unwrap_or_default(),
+            core: s("core"),
+            session_id: s("session_id"),
+            task: s("task"),
+            message_count: v
+                .get("message_count")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                .max(0) as usize,
+            scope: s("scope"),
+            markers,
+        }
+    }
+}
+
 /// Sniff the format from the first lines: JSONL with `sessionId` is Claude
 /// Code; other structured JSONL (role/message/content) is Codex-style; a
 /// non-JSON line means plain text, so Generic.
@@ -829,5 +902,35 @@ mod tests {
             rec.markers,
             vec![(MemoryType::Fact, "configs live in etc".to_string())]
         );
+    }
+
+    #[test]
+    fn session_record_json_round_trips_and_is_byte_stable() {
+        let rec = SessionRecord {
+            harness: "hermes".to_string(),
+            core: Some("hermes-4-405b".to_string()),
+            session_id: Some("s1".to_string()),
+            task: Some("port the ingest service".to_string()),
+            message_count: 7,
+            scope: Some("project:acme".to_string()),
+            markers: vec![
+                (MemoryType::Decision, "chose parquet".to_string()),
+                (MemoryType::Rule, "keep the contract stable".to_string()),
+            ],
+        };
+        let json = rec.to_json();
+        assert_eq!(
+            SessionRecord::from_json(&json),
+            rec,
+            "canonical JSON round-trips"
+        );
+        assert_eq!(
+            json.emit(),
+            rec.to_json().emit(),
+            "byte-stable serialization"
+        );
+        // A record with no model/session (generic path) still round-trips.
+        let bare = parse("MEMORY fact: x", Format::Generic, Some("unknown"), None);
+        assert_eq!(SessionRecord::from_json(&bare.to_json()), bare);
     }
 }
