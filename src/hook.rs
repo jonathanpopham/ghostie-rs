@@ -131,6 +131,41 @@ pub fn run_capture(store: &Store, stdin: &str, do_sync: bool, clock: &dyn Clock)
     Ok(msg)
 }
 
+/// Codex `notify` runner: Codex has no transcript path in its event, so find
+/// the just-finished rollout ourselves and capture it. `notify_arg` is the JSON
+/// Codex appends as the last argv argument (stdin is a fallback). Idempotent —
+/// agent-turn-complete fires per turn, but capture dedups by session id.
+/// Mirrors [`run_capture`]'s sync-failure surfacing when `do_sync`.
+pub fn run_capture_codex_notify(
+    store: &Store,
+    notify_arg: Option<&str>,
+    stdin: &str,
+    do_sync: bool,
+    clock: &dyn Clock,
+) -> Result<String> {
+    let home = crate::codex::codex_home()?;
+    let created = crate::codex::run_notify_capture(store, &home, notify_arg, stdin, clock)?;
+    let mut msg = format!("ghostie: captured {} memory(ies) from Codex", created.len());
+    if do_sync && sync::git_available() {
+        match sync::sync(store, clock) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(sync_error_path(store));
+                msg.push_str("; synced");
+            }
+            Err(e) => {
+                let note = format!(
+                    "ghostie sync FAILED at {}: {e}",
+                    format_rfc3339_utc(clock.now_epoch_seconds())
+                );
+                let _ = std::fs::write(sync_error_path(store), format!("{note}\n"));
+                eprintln!("{note}");
+                msg.push_str(&format!("; SYNC FAILED ({e})"));
+            }
+        }
+    }
+    Ok(msg)
+}
+
 /// Where the last sync failure is recorded (cleared on the next success);
 /// `hook status` surfaces it so a stalled backup is visible.
 pub fn sync_error_path(store: &Store) -> std::path::PathBuf {

@@ -66,6 +66,16 @@ removes it, leaving your other settings untouched.
 Under the button are the parts, usable on their own: `ghostie sync --init
 <remote>` then `ghostie sync`, and `ghostie hook install`.
 
+Codex auto-capture works too. Codex has no pre-prompt hook, but it has a
+`notify` program it runs after each turn, so `ghostie hook install --harness
+codex [--sync]` sets that program in `~/.codex/config.toml` (backing the config
+up first). On each completed turn it captures the just-finished rollout from
+`~/.codex/sessions`, deduped by session id so a repeated notify is a no-op. If
+you already have a `notify` configured, ghostie will not overwrite it; it prints
+the exact line to merge yourself. `ghostie hook status --harness codex` and
+`ghostie hook uninstall --harness codex` manage it. You can also capture the
+latest Codex session on demand with `ghostie capture --latest codex`.
+
 `ghostie capture <transcript>` distills a session by hand: a session-summary
 carrying provenance plus one memory per `MEMORY <type>: ...` marker left in the
 transcript. Sync shells to the system `git` binary (a tool, not a crate), so
