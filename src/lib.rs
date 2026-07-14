@@ -19,6 +19,7 @@ mod error;
 pub mod hook;
 pub mod json;
 pub mod mcp;
+pub mod provenance;
 pub mod recall;
 pub mod redact;
 pub mod store;

@@ -115,6 +115,20 @@ byte_stability(){
     return 1
   fi
   echo "  PASS store determinism (two runs, byte-identical memories/ trees)"
+  # 1b. Provenance-log determinism: the hash-chained log is stamped from the
+  #     frozen clock, so two identical seed runs produce byte-identical logs.
+  if [ -f "$SCRATCH/bs-a/.provenance/log.jsonl" ]; then
+    if ! cmp -s "$SCRATCH/bs-a/.provenance/log.jsonl" "$SCRATCH/bs-b/.provenance/log.jsonl"; then
+      echo "  provenance logs differ between two identical runs:"
+      diff "$SCRATCH/bs-a/.provenance/log.jsonl" "$SCRATCH/bs-b/.provenance/log.jsonl" | head -10
+      return 1
+    fi
+    # And the chain must verify INTACT through the real binary.
+    if ! "$BIN" --store "$SCRATCH/bs-a" provenance verify --json | grep -q '"status":"intact"'; then
+      echo "  provenance chain not INTACT after seeding"; return 1
+    fi
+    echo "  PASS provenance log determinism + INTACT chain"
+  fi
   # 2. Canonicalization idempotence: dogfood corpus is canonical; a
   #    re-canonicalize write pass must change nothing.
   mkdir -p "$SCRATCH/bs-canon/memories"
@@ -187,6 +201,9 @@ guard_robot_mode(){
       # Bare `mcp` prints a one-shot manifest and exits; NEVER `mcp serve`,
       # which is a long-running stdin loop and would block the audit.
       mcp)      out="$("$BIN" --store "$store" mcp --json || true)" ;;
+      # `provenance verify` replays the chain; on this API-written store it is
+      # INTACT (ok:true). A usage/BROKEN case would still emit one envelope.
+      provenance) out="$("$BIN" --store "$store" provenance verify --json || true)" ;;
       *) echo "  new subcommand '$sub' has no robot audit case — add one"; return 1 ;;
     esac
     if [ -z "$out" ] || [ "${out:0:1}" != "{" ] || [ "$(printf '%s\n' "$out" | wc -l)" -ne 1 ]; then
