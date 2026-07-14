@@ -31,12 +31,13 @@ use std::path::PathBuf;
 
 /// Subcommands implemented so far, in help order. The robot audit and the
 /// e2e suite iterate THIS list, so a new verb is auto-covered.
-pub const SUBCOMMANDS: [&str; 9] = [
+pub const SUBCOMMANDS: [&str; 10] = [
     "setup",
     "remember",
     "recall",
     "list",
     "capture",
+    "review",
     "sync",
     "hook",
     "mcp",
@@ -92,6 +93,7 @@ pub fn execute(args: &[String], stdin_body: Option<&str>) -> CliOutput {
         "capture" => wrap(command, &parsed, |store| {
             cmd_capture(store, rest, json_mode)
         }),
+        "review" => wrap(command, &parsed, |store| cmd_review(store, rest, json_mode)),
         "sync" => wrap(command, &parsed, |store| cmd_sync(store, rest, json_mode)),
         "hook" => wrap(command, &parsed, |store| cmd_hook(store, rest, json_mode)),
         "mcp" => wrap(command, &parsed, |store| cmd_mcp(store, rest, json_mode)),
@@ -281,6 +283,7 @@ COMMANDS
   recall     query the store; ranked hits, each with a why
   list       enumerate memories deterministically
   capture    distill a session log into memories
+  review     approve/reject captured candidates before they enter memory
   sync       sync the store via your own git remote (--init <remote> first)
   hook       auto-recall / auto-capture: `hook install`, `status`, `uninstall`
   mcp        serve ghostie as an MCP server (`mcp serve`) for any MCP client
@@ -397,6 +400,9 @@ ghostie capture --latest codex [--scope s]
   --harness <h>   override the recorded harness (claude-code | codex | hermes)
   --core <c>      override the recorded model
   --scope <s>     stamp a retrieval scope (global | project:<name>)
+  --pending       write candidates to the review queue (<store>/.pending) instead
+                  of live memory; approve them later with `ghostie review`. Opt-in
+                  trust gate: nothing enters memory (or syncs) until you approve
   --distill       also distill decisions/rules/facts from the transcript, not
                   just explicit markers. Deterministic std-only heuristic by
                   default (airgap-pure); a build compiled with --features distill
@@ -417,15 +423,58 @@ EXAMPLES
 EXIT CODES: 0 success · 1 failure · 2 bad arguments
 ";
 
+const HELP_REVIEW: &str = "\
+ghostie review [list]
+ghostie review approve <id> | --all
+ghostie review reject  <id> | --all
+
+  The trust / approval gate. When capture runs with `--pending` (or a hook
+  installed with `--review`), candidate memories are written to a pending queue
+  (<store>/.pending) instead of live memory, and never sync. `review` lets you
+  approve what actually enters memory.
+
+  list            show the pending candidates (default when no subcommand)
+  approve <id>    promote one candidate into the live store (it then syncs)
+  approve --all   promote every pending candidate
+  reject <id>     drop one candidate, unpromoted
+  reject --all    drop every pending candidate
+
+EXAMPLES
+  ghostie capture ~/.codex/rollout-*.jsonl --pending
+  ghostie review --json
+  ghostie review approve fact-configs-live-in-etc-1
+  ghostie review reject --all
+
+EXIT CODES: 0 success · 1 failure · 2 bad arguments
+";
+
 const HELP_SYNC: &str = "\
-ghostie sync [--init <git-remote>]
+ghostie sync [--init <git-remote>] [--encrypt]
 
   --init <remote>   one-time: make the store a git repo pointed at your own
                     remote (the derived index is never synced)
   (no args)         commit local changes, rebase in remote changes, push
+  --encrypt         encrypt memory files before commit/push and decrypt on pull,
+                    using your own private + encrypted remote (see below)
 
   Conflicts are reported, never auto-resolved (exit code 3): the working tree
   is left untouched for you to resolve, then re-run.
+
+ENCRYPTED REMOTE (--encrypt)
+  The plaintext store on your disk stays readable; only an encrypted mirror
+  (<store>/.enc) is committed and pushed, so the remote holds ciphertext only.
+  Shells to `age` (preferred) or `gpg` (an external tool, not a dependency).
+
+  One-time:   ghostie sync --encrypt --init <your-private-encrypted-remote>
+  Each sync:  ghostie sync --encrypt
+
+  Provide a key via the environment:
+    age:  export GHOSTIE_AGE_RECIPIENT=age1...      (public key)
+          export GHOSTIE_AGE_IDENTITY=~/.ghostie-age.key   (to decrypt/restore)
+    gpg:  export GHOSTIE_GPG_PASSPHRASE='a strong passphrase'   (symmetric)
+
+  This complements the write-path secret redaction: redaction scrubs known
+  credential shapes; encryption keeps the whole file unreadable on the remote.
 
 EXIT CODES: 0 success · 1 failure · 2 bad arguments · 3 sync conflict
 ";
@@ -433,13 +482,16 @@ EXIT CODES: 0 success · 1 failure · 2 bad arguments · 3 sync conflict
 const HELP_HOOK: &str = "\
 ghostie hook <subcommand>
 
-  install [--budget N] [--sync] [--distill]
+  install [--budget N] [--sync] [--distill] [--review]
                                   wire Claude Code to recall relevant memories
                                   on each prompt and capture (and optionally
                                   push) on session end; backs up settings first.
                                   --distill also distills decisions/rules/facts
                                   (heuristic by default; model path needs a
-                                  --features distill build)
+                                  --features distill build).
+                                  --review sends captures to the review queue
+                                  (trust gate) instead of live memory; approve
+                                  with `ghostie review` (implies no auto-sync)
   install --harness codex [--sync]
                                   wire Codex: set its `notify` program in
                                   ~/.codex/config.toml so each completed turn
@@ -450,10 +502,11 @@ ghostie hook <subcommand>
   uninstall [--harness codex]     remove ghostie's hooks, leave the rest
   run recall [--budget N]         runner: reads the hook payload on stdin,
                                   emits injectable context (invoked by install)
-  run capture [--sync] [--distill]
+  run capture [--sync] [--distill] [--pending]
                                   runner: captures the transcript named in the
                                   payload, optionally syncs; --distill distills
-                                  richer memories (heuristic by default)
+                                  richer memories (heuristic by default);
+                                  --pending writes to the review queue (no sync)
   run capture --codex-notify [--sync]
                                   runner Codex calls: reads the notify event
                                   (last argv arg) and captures the newest
@@ -509,6 +562,7 @@ fn help(rest: &[String], json_mode: bool) -> CliOutput {
         Some("recall") => HELP_RECALL,
         Some("list") => HELP_LIST,
         Some("capture") => HELP_CAPTURE,
+        Some("review") => HELP_REVIEW,
         Some("sync") => HELP_SYNC,
         Some("hook") => HELP_HOOK,
         Some("mcp") => HELP_MCP,
@@ -1051,10 +1105,15 @@ fn cmd_capture(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk
     let mut latest: Option<String> = None;
     let mut no_redact = false;
     let mut distill = false;
+    let mut pending = false;
     let mut distill_cmd: Option<String> = None;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
+            // Trust gate (opt-in): write candidates to <store>/.pending for
+            // review instead of live memory, so nothing enters (or syncs) until
+            // approved via `ghostie review`.
+            "--pending" => pending = true,
             // Opt-in richer distillation: pull decisions/rules/facts out of the
             // transcript (heuristic by default; the model path is feature-gated
             // and only active in a `--features distill` build).
@@ -1153,13 +1212,22 @@ fn cmd_capture(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk
         (path, format, harness)
     };
     let clock = resolve_clock()?;
+    // The trust gate: with --pending, capture into <store>/.pending (a full
+    // store) so candidates await `ghostie review` and never sync until approved.
+    let pending_store;
+    let target: &Store = if pending {
+        pending_store = crate::review::pending_store(store);
+        &pending_store
+    } else {
+        store
+    };
     if no_redact {
-        store.set_redaction(false);
+        target.set_redaction(false);
     }
     let created = if distill {
         let distiller = crate::distill::build_distiller(distill_cmd.as_deref());
         capture::capture_file_with_distill(
-            store,
+            target,
             &path,
             format,
             harness.as_deref(),
@@ -1170,7 +1238,7 @@ fn cmd_capture(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk
         )?
     } else {
         capture::capture_file(
-            store,
+            target,
             &path,
             format,
             harness.as_deref(),
@@ -1189,7 +1257,14 @@ fn cmd_capture(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk
             ])
         })
         .collect();
-    let mut human = format!("captured {} memory(ies):\n", created.len());
+    let mut human = if pending {
+        format!(
+            "captured {} candidate(s) to the review queue (approve with `ghostie review`):\n",
+            created.len()
+        )
+    } else {
+        format!("captured {} memory(ies):\n", created.len())
+    };
     for m in &created {
         human.push_str(&format!(
             "  {}  [{}]  {}\n",
@@ -1199,10 +1274,107 @@ fn cmd_capture(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk
         ));
     }
     Ok(CmdOk {
-        data: Value::Object(vec![("created".to_string(), Value::Array(items))]),
+        data: Value::Object(vec![
+            ("created".to_string(), Value::Array(items)),
+            ("pending".to_string(), Value::Bool(pending)),
+        ]),
         human,
         warnings: Vec::new(),
     })
+}
+
+/// `review` (or `review list`) shows pending capture candidates; `review
+/// approve <id>|--all` promotes them into the live store (then they sync);
+/// `review reject <id>|--all` drops them. The trust gate before auto-capture /
+/// sync land a memory.
+fn cmd_review(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, Error> {
+    let usage = |message: String| Error::Usage { message };
+    match rest.first().map(String::as_str) {
+        None | Some("list") => {
+            if rest.len() > 1 {
+                return Err(usage(format!(
+                    "review list takes no arguments (got {:?})",
+                    &rest[1..]
+                )));
+            }
+            let (pending, warnings) = crate::review::list_pending(store)?;
+            let items: Vec<Value> = pending
+                .iter()
+                .map(|m| {
+                    Value::Object(vec![
+                        ("id".to_string(), Value::string(m.id.clone())),
+                        ("type".to_string(), Value::string(m.mtype.as_str())),
+                        ("title".to_string(), Value::string(m.title.clone())),
+                    ])
+                })
+                .collect();
+            let mut human = if pending.is_empty() {
+                "no pending candidates\n".to_string()
+            } else {
+                format!("{} pending candidate(s):\n", pending.len())
+            };
+            for m in &pending {
+                human.push_str(&format!(
+                    "  {}  [{}]  {}\n",
+                    m.id,
+                    m.mtype.as_str(),
+                    m.title
+                ));
+            }
+            Ok(CmdOk {
+                data: Value::Object(vec![
+                    ("pending".to_string(), Value::Array(items)),
+                    ("count".to_string(), Value::int(pending.len() as i64)),
+                ]),
+                human,
+                warnings,
+            })
+        }
+        Some(action @ ("approve" | "reject")) => {
+            let approve = action == "approve";
+            let arg = rest.get(1).map(String::as_str);
+            let all = arg == Some("--all");
+            if arg.is_none() {
+                return Err(usage(format!("review {action} needs a memory id or --all")));
+            }
+            let clock = resolve_clock()?;
+            let ids: Vec<String> = if all {
+                if approve {
+                    crate::review::approve_all(store, clock.as_ref())?
+                } else {
+                    crate::review::reject_all(store)?
+                }
+            } else {
+                let id = arg.unwrap();
+                let done = if approve {
+                    crate::review::approve(store, id, clock.as_ref())?
+                } else {
+                    crate::review::reject(store, id)?
+                };
+                vec![done]
+            };
+            let verb = if approve { "approved" } else { "rejected" };
+            let mut human = format!("{verb} {} candidate(s)\n", ids.len());
+            for id in &ids {
+                human.push_str(&format!("  {id}\n"));
+            }
+            Ok(CmdOk {
+                data: Value::Object(vec![
+                    ("action".to_string(), Value::string(action)),
+                    (
+                        verb.to_string(),
+                        Value::Array(ids.iter().map(Value::string).collect()),
+                    ),
+                    ("count".to_string(), Value::int(ids.len() as i64)),
+                ]),
+                human,
+                warnings: Vec::new(),
+            })
+        }
+        Some(other) => Err(usage(format!(
+            "unknown review subcommand '{other}' (list | approve | reject)"
+        ))),
+    }
 }
 
 /// `sync --init <remote>` wires the store to your own git remote; `sync`
@@ -1210,6 +1382,7 @@ fn cmd_capture(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk
 fn cmd_sync(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, Error> {
     let usage = |message: String| Error::Usage { message };
     let mut init: Option<String> = None;
+    let mut encrypt = false;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -1221,9 +1394,44 @@ fn cmd_sync(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
                         .clone(),
                 );
             }
+            // Encrypt memory files before commit/push (age preferred, else gpg),
+            // pushing only ciphertext to your own private encrypted remote.
+            "--encrypt" => encrypt = true,
             a => return Err(usage(format!("unknown argument '{a}' for sync"))),
         }
         i += 1;
+    }
+    if encrypt {
+        if let Some(remote) = init {
+            sync::sync_encrypted_init(store, &remote)?;
+            return Ok(CmdOk {
+                data: Value::Object(vec![
+                    ("initialized".to_string(), Value::Bool(true)),
+                    ("encrypted".to_string(), Value::Bool(true)),
+                    ("remote".to_string(), Value::string(remote.clone())),
+                ]),
+                human: format!("encrypted sync initialized against {remote}\n"),
+                warnings: Vec::new(),
+            });
+        }
+        let clock = resolve_clock()?;
+        let out = sync::sync_encrypted(store, clock.as_ref())?;
+        return Ok(CmdOk {
+            data: Value::Object(vec![
+                ("encrypted".to_string(), Value::int(out.encrypted as i64)),
+                ("decrypted".to_string(), Value::int(out.decrypted as i64)),
+                ("pushed".to_string(), Value::Bool(out.pushed)),
+                ("tool".to_string(), Value::string(out.tool)),
+            ]),
+            human: format!(
+                "encrypted sync ok ({}): {} encrypted, {} decrypted{}\n",
+                out.tool,
+                out.encrypted,
+                out.decrypted,
+                if out.pushed { ", pushed" } else { "" },
+            ),
+            warnings: Vec::new(),
+        });
     }
     if let Some(remote) = init {
         sync::sync_init(store, &remote)?;
@@ -1326,6 +1534,8 @@ fn cmd_hook(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
                     // airgap-pure heuristic unless a `--features distill` build
                     // has a configured agent).
                     let distill = rest.iter().any(|a| a == "--distill");
+                    // Trust gate: capture to the review queue instead of live.
+                    let pending = rest.iter().any(|a| a == "--pending");
                     let clock = resolve_clock()?;
                     // Codex path: no transcript in the event; find + capture the
                     // newest rollout. Codex appends the event JSON as the last
@@ -1344,7 +1554,7 @@ fn cmd_hook(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
                             clock.as_ref(),
                         )?
                     } else {
-                        hook::run_capture(store, &stdin, do_sync, distill, clock.as_ref())?
+                        hook::run_capture(store, &stdin, do_sync, distill, pending, clock.as_ref())?
                     };
                     Ok(CmdOk {
                         data: Value::Object(vec![(
@@ -1362,6 +1572,7 @@ fn cmd_hook(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
             let mut budget = hook::DEFAULT_BUDGET;
             let mut do_sync = false;
             let mut distill = false;
+            let mut review = false;
             let mut harness = "claude-code".to_string();
             let mut i = 1;
             while i < rest.len() {
@@ -1378,6 +1589,9 @@ fn cmd_hook(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
                     // off). Airgap-pure heuristic unless a feature-on build has
                     // an agent configured.
                     "--distill" => distill = true,
+                    // Trust gate: wire capture to write candidates to the review
+                    // queue (--pending) instead of live memory.
+                    "--review" => review = true,
                     "--harness" => {
                         i += 1;
                         harness = rest
@@ -1474,7 +1688,7 @@ fn cmd_hook(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
                 });
             }
             let settings = hook::claude_settings_path()?;
-            let rep = hook::install_at(&settings, store.root(), budget, do_sync, distill)?;
+            let rep = hook::install_at(&settings, store.root(), budget, do_sync, distill, review)?;
             Ok(CmdOk {
                 data: Value::Object(vec![
                     (
@@ -1730,7 +1944,7 @@ fn cmd_setup(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, 
         steps.push(format!("sync wired to {r}"));
     }
     let settings = hook::claude_settings_path()?;
-    let rep = hook::install_at(&settings, store.root(), budget, do_sync, false)?;
+    let rep = hook::install_at(&settings, store.root(), budget, do_sync, false, false)?;
     steps.push(format!(
         "recall + capture hooks installed{}",
         if rep.backed_up {

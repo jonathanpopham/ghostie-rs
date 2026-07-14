@@ -12,11 +12,17 @@
 //! The derived `.index/` is never synced (it is rebuildable and would only
 //! manufacture conflicts).
 
+use crate::crypt;
 use crate::error::{Error, Result};
 use crate::store::Store;
 use crate::util::{Clock, format_rfc3339_utc};
 use std::path::Path;
 use std::process::Command;
+
+/// Ignore rules for the PLAINTEXT store repo: the rebuildable index, the
+/// unapproved review candidates, and the ciphertext mirror all stay local and
+/// out of the plaintext remote.
+const STORE_IGNORE: [&str; 3] = [".index/", ".pending/", ".enc/"];
 
 /// The result of a successful sync, for reporting.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,11 +77,18 @@ pub fn git_available() -> bool {
 /// Initialise the store as a git repo pointed at the user's own `remote`.
 /// Idempotent: safe to re-run to change the remote. Sets a local identity so
 /// commits never fail on a machine with no global git identity, and ignores
-/// the derived index.
+/// the derived index, the pending candidates, and the ciphertext mirror.
 pub fn sync_init(store: &Store, remote: &str) -> Result<()> {
-    let root = store.root();
+    git_init_at(store.root(), remote, &STORE_IGNORE)
+}
+
+/// Initialise `root` as a git repo pointed at `remote`, writing `ignore` lines
+/// into its `.gitignore`. Shared by the plaintext store ([`sync_init`]) and the
+/// encrypted mirror ([`sync_encrypted_init`]); the latter passes no ignores so
+/// every ciphertext file is committed.
+fn git_init_at(root: &Path, remote: &str, ignore: &[&str]) -> Result<()> {
     std::fs::create_dir_all(root).map_err(|e| Error::Io {
-        context: "creating store directory for sync".to_string(),
+        context: "creating directory for sync".to_string(),
         path: root.display().to_string(),
         source: e,
     })?;
@@ -103,7 +116,9 @@ pub fn sync_init(store: &Store, remote: &str) -> Result<()> {
         let _ = git(root, &["config", "user.email", "ghostie@localhost"]);
         let _ = git(root, &["config", "user.name", "ghostie"]);
     }
-    ensure_gitignore(root)?;
+    if !ignore.is_empty() {
+        ensure_gitignore(root, ignore)?;
+    }
     let has_origin = git(root, &["remote"])?
         .stdout
         .lines()
@@ -122,9 +137,11 @@ pub fn sync_init(store: &Store, remote: &str) -> Result<()> {
     Ok(())
 }
 
-/// Ensure `.gitignore` excludes the derived index (append if missing, create
-/// if absent). The index is rebuildable, so syncing it only makes conflicts.
-fn ensure_gitignore(root: &Path) -> Result<()> {
+/// Ensure `.gitignore` excludes each of `lines` (append any missing, create if
+/// absent). These are rebuildable or unapproved artifacts (`.index/`,
+/// `.pending/`, `.enc/`), so syncing them only makes conflicts or leaks
+/// unapproved candidates.
+fn ensure_gitignore(root: &Path, lines: &[&str]) -> Result<()> {
     let path = root.join(".gitignore");
     // Only a genuinely-absent file is treated as empty. A decode/permission
     // error must NOT be silently overwritten (that would drop the user's
@@ -140,14 +157,22 @@ fn ensure_gitignore(root: &Path) -> Result<()> {
             });
         }
     };
-    if existing.lines().any(|l| l.trim() == ".index/") {
+    let mut next = existing.clone();
+    let mut changed = false;
+    for line in lines {
+        if next.lines().any(|l| l.trim() == *line) {
+            continue;
+        }
+        if !next.is_empty() && !next.ends_with('\n') {
+            next.push('\n');
+        }
+        next.push_str(line);
+        next.push('\n');
+        changed = true;
+    }
+    if !changed {
         return Ok(());
     }
-    let mut next = existing;
-    if !next.is_empty() && !next.ends_with('\n') {
-        next.push('\n');
-    }
-    next.push_str(".index/\n");
     std::fs::write(&path, next).map_err(|e| Error::Io {
         context: "writing .gitignore".to_string(),
         path: path.display().to_string(),
@@ -193,14 +218,19 @@ fn sync_branch(root: &Path) -> String {
 /// Commit local changes, rebase in anything on the remote, and push. A rebase
 /// conflict is aborted and surfaced (exit 3), never auto-resolved.
 pub fn sync(store: &Store, clock: &dyn Clock) -> Result<SyncOutcome> {
-    let root = store.root();
-    if !root.join(".git").exists() {
+    if !store.root().join(".git").exists() {
         return Err(Error::Usage {
             message: "store is not initialised for sync; run `ghostie sync --init <remote>` first"
                 .to_string(),
         });
     }
+    sync_git(store.root(), clock)
+}
 
+/// The commit / fetch / rebase / push loop for a git repo rooted at `root`.
+/// Shared by the plaintext store ([`sync`]) and the encrypted ciphertext mirror
+/// ([`sync_encrypted`]); assumes `root/.git` already exists.
+fn sync_git(root: &Path, clock: &dyn Clock) -> Result<SyncOutcome> {
     // Agree on one branch across devices: follow the remote's default branch
     // when it advertises one, and pin our unborn HEAD to it so the first
     // commit lands there rather than on this machine's local default.
@@ -246,16 +276,29 @@ pub fn sync(store: &Store, clock: &dyn Clock) -> Result<SyncOutcome> {
     let remote_ref = format!("origin/{branch}");
     let mut pulled = false;
     if git(root, &["rev-parse", "--verify", "--quiet", &remote_ref])?.ok {
-        let rb = git(root, &["rebase", &remote_ref])?;
-        if !rb.ok {
-            let _ = git(root, &["rebase", "--abort"]);
-            return Err(Error::Conflict {
-                message: format!(
-                    "rebase onto {remote_ref} hit a conflict; the working tree is unchanged. \
-                     Resolve in {} and re-run `ghostie sync`.",
-                    root.display()
-                ),
-            });
+        if is_unborn(root) {
+            // An empty local repo (nothing to commit, e.g. a fresh device with
+            // an empty encrypted mirror) cannot rebase; adopt the remote branch
+            // wholesale. There is no local work to conflict with.
+            let r = git(root, &["reset", "--hard", &remote_ref])?;
+            if !r.ok {
+                return Err(Error::Invalid {
+                    origin: "sync".to_string(),
+                    message: format!("adopting {remote_ref} failed: {}", r.stderr.trim()),
+                });
+            }
+        } else {
+            let rb = git(root, &["rebase", &remote_ref])?;
+            if !rb.ok {
+                let _ = git(root, &["rebase", "--abort"]);
+                return Err(Error::Conflict {
+                    message: format!(
+                        "rebase onto {remote_ref} hit a conflict; the working tree is unchanged. \
+                         Resolve in {} and re-run `ghostie sync`.",
+                        root.display()
+                    ),
+                });
+            }
         }
         pulled = true;
     }
@@ -274,6 +317,101 @@ pub fn sync(store: &Store, clock: &dyn Clock) -> Result<SyncOutcome> {
         pulled,
         pushed: true,
         branch,
+    })
+}
+
+/// The result of an encrypted sync, for reporting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncryptOutcome {
+    /// Memory files encrypted into the ciphertext mirror this run.
+    pub encrypted: usize,
+    /// Memory files decrypted back from the mirror (fresh device / after pull).
+    pub decrypted: usize,
+    /// The ciphertext mirror was pushed to its remote.
+    pub pushed: bool,
+    /// The tool used (`age` or `gpg`), for the human/robot report.
+    pub tool: &'static str,
+}
+
+/// Initialise the ciphertext mirror `<store>/.enc/` as its own git repo pointed
+/// at the user's own *encrypted* `remote`. Kept separate from the plaintext
+/// remote so the two never mix: the plaintext store repo (if any) ignores
+/// `.enc/`, and only ciphertext lands on this remote.
+pub fn sync_encrypted_init(store: &Store, remote: &str) -> Result<()> {
+    let enc = crypt::enc_dir(store);
+    std::fs::create_dir_all(enc.join("memories")).map_err(|e| Error::Io {
+        context: "creating encrypted mirror directory".to_string(),
+        path: enc.display().to_string(),
+        source: e,
+    })?;
+    // No ignores: every ciphertext file is committed to the encrypted remote.
+    git_init_at(&enc, remote, &[])
+}
+
+/// Does the store hold at least one plaintext memory file?
+fn has_any_memory(store: &Store) -> bool {
+    std::fs::read_dir(store.memories_dir())
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.ends_with(".md") && !n.starts_with('.')
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Encrypted sync: encrypt the store's memory files into the `<store>/.enc/`
+/// ciphertext mirror before commit/push, and decrypt on pull. The plaintext
+/// store on disk is never touched by this beyond a fresh-device restore, and
+/// the DEFAULT [`sync`] path is entirely independent.
+///
+/// Flow: on a fresh device (ciphertext present, no local plaintext) decrypt
+/// first to restore. Encrypt the current plaintext into the mirror. If the
+/// mirror is a git repo, commit / rebase / push it (a rebase conflict on
+/// ciphertext surfaces as [`Error::Conflict`], exit 3, like the plaintext
+/// path); after a pull, decrypt anything new so a second device sees it.
+pub fn sync_encrypted(store: &Store, clock: &dyn Clock) -> Result<EncryptOutcome> {
+    let cfg = crypt::CryptConfig::from_env()?;
+    if !crypt::available(cfg.tool) {
+        return Err(Error::Usage {
+            message: format!(
+                "encrypted sync needs the `{}` tool on PATH (not found)",
+                cfg.tool.binary()
+            ),
+        });
+    }
+    sync_encrypted_with(store, &cfg, clock)
+}
+
+/// The encrypted-sync core with an explicit [`crypt::CryptConfig`] (so it is
+/// testable without mutating process env, which is `unsafe` under edition
+/// 2024). [`sync_encrypted`] is the thin env-reading wrapper.
+pub fn sync_encrypted_with(
+    store: &Store,
+    cfg: &crypt::CryptConfig,
+    clock: &dyn Clock,
+) -> Result<EncryptOutcome> {
+    let enc = crypt::enc_dir(store);
+    let mut decrypted = 0usize;
+    // Fresh-device restore: ciphertext exists but no local plaintext yet.
+    if enc.join("memories").exists() && !has_any_memory(store) {
+        decrypted += crypt::decrypt_store(store, cfg)?;
+    }
+    let encrypted = crypt::encrypt_store(store, cfg)?;
+    let mut pushed = false;
+    if enc.join(".git").exists() {
+        let outcome = sync_git(&enc, clock)?;
+        pushed = outcome.pushed;
+        // A pull may have brought a peer's ciphertext; decrypt it into place.
+        if outcome.pulled {
+            decrypted += crypt::decrypt_store(store, cfg)?;
+        }
+    }
+    Ok(EncryptOutcome {
+        encrypted,
+        decrypted,
+        pushed,
+        tool: cfg.tool.binary(),
     })
 }
 
@@ -344,6 +482,61 @@ mod tests {
         remember(&store, "x");
         let e = sync(&store, &FixedClock(T0)).unwrap_err();
         assert!(matches!(e, Error::Usage { .. }), "got {e:?}");
+    }
+
+    fn gpg_cfg() -> crypt::CryptConfig {
+        crypt::CryptConfig {
+            tool: crypt::Tool::Gpg,
+            recipient: None,
+            identity: None,
+            passphrase: Some("ghostie-sync-test-pass".to_string()),
+        }
+    }
+
+    #[test]
+    fn encrypted_sync_pushes_ciphertext_and_restores_on_a_second_device() {
+        if !git_available() || !crypt::gpg_available() {
+            eprintln!("SKIP: git or gpg not available");
+            return;
+        }
+        let cfg = gpg_cfg();
+        let remote_dir = TempDir::new("enc-remote");
+        std::fs::create_dir_all(remote_dir.path()).unwrap();
+        let remote = bare_remote(remote_dir.path());
+
+        // Device A: remember, init the encrypted mirror, encrypted-sync (push).
+        let a = TempDir::new("enc-a");
+        let store_a = Store::open(a.path());
+        remember(&store_a, "a secret only for me");
+        sync_encrypted_init(&store_a, &remote).unwrap();
+        let out = sync_encrypted_with(&store_a, &cfg, &FixedClock(T0)).unwrap();
+        assert!(out.encrypted >= 1 && out.pushed, "{out:?}");
+        // The remote holds only ciphertext: the plaintext title is not in the
+        // committed .enc tree.
+        let enc_mem = crypt::enc_dir(&store_a).join("memories");
+        for e in std::fs::read_dir(&enc_mem).unwrap().flatten() {
+            let bytes = std::fs::read(e.path()).unwrap();
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains("a secret only for me"),
+                "ciphertext must not leak the plaintext"
+            );
+        }
+
+        // Device B: init against the same encrypted remote, encrypted-sync;
+        // it pulls ciphertext and decrypts the memory into its plaintext store.
+        let b = TempDir::new("enc-b");
+        let store_b = Store::open(b.path());
+        sync_encrypted_init(&store_b, &remote).unwrap();
+        let out = sync_encrypted_with(&store_b, &cfg, &FixedClock(T0)).unwrap();
+        assert!(
+            out.decrypted >= 1,
+            "device B restored from ciphertext: {out:?}"
+        );
+        let (mems, _) = store_b.list(&crate::store::ListFilter::default()).unwrap();
+        assert!(
+            mems.iter().any(|m| m.title == "a secret only for me"),
+            "the encrypted memory decrypted onto device B"
+        );
     }
 
     #[test]

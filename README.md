@@ -206,6 +206,71 @@ written and synced. It is deterministic and byte-stable: the same input always
 produces the same output. For the rare case where content must be stored
 verbatim, `remember --no-redact` and `capture --no-redact` turn the gate off.
 
+## Trust gate: review before it enters memory
+
+Auto-capture is convenient, but you may not want every distilled candidate to
+land in memory (and sync) unattended. The trust gate makes capture stage
+candidates for your approval instead:
+
+```
+ghostie capture ~/.codex/rollout-*.jsonl --pending   # write to the review queue
+ghostie review                                        # list pending candidates
+ghostie review approve fact-configs-live-in-etc-1     # promote one into memory
+ghostie review approve --all                          # promote all
+ghostie review reject --all                           # drop the rest
+```
+
+With `--pending`, candidates are written to `<store>/.pending` (a full store of
+its own) instead of live memory. They are gitignored, so an unapproved
+candidate never reaches your remote. `ghostie review approve` promotes a
+candidate into the live store under the same id (then a normal `sync` carries
+it); `reject` drops it. Everything has a `--json` robot mode.
+
+It is opt-in, so the default auto-capture flow is unchanged. To make auto-capture
+itself route through the queue, install the hook with `--review`:
+
+```
+ghostie hook install --review          # SessionEnd capture writes to the queue
+```
+
+## Encrypted remote
+
+Sync uses your own git remote, and the write-path redaction above scrubs known
+credential shapes. If you want the remote itself to hold nothing readable,
+`sync --encrypt` encrypts your memory files before they are committed and
+pushed, and decrypts them on pull. The plaintext store on your disk stays
+readable and hand-editable (the whole point); only an encrypted mirror
+(`<store>/.enc`) is committed, so the remote sees ciphertext only.
+
+It shells to `age` (preferred) or `gpg`, an external tool like `git`, so the
+crate stays zero-dependency. Provide a key through the environment:
+
+```
+# age (recommended): generate a keypair once
+age-keygen -o ~/.ghostie-age.key            # prints the public key (age1...)
+export GHOSTIE_AGE_RECIPIENT=age1...         # encrypt to this recipient
+export GHOSTIE_AGE_IDENTITY=~/.ghostie-age.key   # needed to decrypt / restore
+
+# or gpg symmetric (AES-256)
+export GHOSTIE_GPG_PASSPHRASE='a strong passphrase'
+```
+
+Point it at your own private, encrypted remote and sync:
+
+```
+ghostie sync --encrypt --init git@github.com:me/my-encrypted-memory.git
+ghostie sync --encrypt          # encrypt, commit, push ciphertext
+```
+
+On a second device, init against the same encrypted remote and `sync --encrypt`;
+the ciphertext is pulled and decrypted back into your plaintext store. Keep the
+remote private regardless: encryption protects the file contents, but a private
+remote is still the first line of defense. Encrypted output is intentionally not
+byte-stable (age and gpg embed a random file key), so the encrypted mirror is
+never part of the byte-stability contract; your plaintext store remains the
+deterministic artifact. If neither `age` nor `gpg` is installed, `sync --encrypt`
+reports that clearly and the default `sync` path is unaffected.
+
 ## CI
 
 `scripts/verify.sh` is the gate: fmt, clippy (deny warnings), build, test,
