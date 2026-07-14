@@ -388,29 +388,54 @@ fn scan_markers(text: &str) -> Vec<(MemoryType, String)> {
     out
 }
 
-/// Distill a session record into memories: always a `session-summary` (the
-/// cross-provider breadcrumb), plus one memory per marker, each linked back to
-/// the summary. Returns the created memories in creation order.
-pub fn capture(store: &Store, rec: &SessionRecord, clock: &dyn Clock) -> Result<Vec<Memory>> {
-    let mut created = Vec::new();
-    // Scrub secrets from any content that flows into an id/slug BEFORE it is
-    // slugified: the id is both the filename and the frontmatter id, both of
-    // which sync to the remote, and `create_with_id` takes the id verbatim
-    // (unlike `create`, it does not recompute the slug). The stored title/body
-    // are scrubbed again in `build_memory`; re-redaction is idempotent. Honors
-    // the store's `--no-redact` toggle.
-    let scrub = |s: &str| {
-        if store.redaction_enabled() {
-            crate::redact::redact(s).0
-        } else {
-            s.to_string()
-        }
-    };
+/// Scrub secrets from content that flows into an id/slug BEFORE it is
+/// slugified: the id is both the filename and the frontmatter id, both of
+/// which sync to the remote, and `create_with_id` takes the id verbatim
+/// (unlike `create`, it does not recompute the slug). The stored title/body
+/// are scrubbed again in `build_memory`; re-redaction is idempotent. Honors
+/// the store's `--no-redact` toggle.
+fn scrub(store: &Store, s: &str) -> String {
+    if store.redaction_enabled() {
+        crate::redact::redact(s).0
+    } else {
+        s.to_string()
+    }
+}
+
+/// The deterministic session-summary id for a record: `session-summary-<slug of
+/// the scrubbed task>-<8 hex of fnv1a(harness:session_id)>`. Factored out so a
+/// distill pass can re-derive it and link candidates to a summary that already
+/// existed (an idempotent re-capture).
+fn summary_id_for(store: &Store, rec: &SessionRecord) -> String {
     let session_id = rec
         .session_id
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
     let title = scrub(
+        store,
+        &rec.task
+            .clone()
+            .unwrap_or_else(|| "agent session".to_string()),
+    );
+    let sig = crate::util::fnv1a64_hex(format!("{}:{}", rec.harness, session_id).as_bytes());
+    format!(
+        "session-summary-{}-{}",
+        crate::store::slugify(&title),
+        &sig[..8]
+    )
+}
+
+/// Distill a session record into memories: always a `session-summary` (the
+/// cross-provider breadcrumb), plus one memory per marker, each linked back to
+/// the summary. Returns the created memories in creation order.
+pub fn capture(store: &Store, rec: &SessionRecord, clock: &dyn Clock) -> Result<Vec<Memory>> {
+    let mut created = Vec::new();
+    let session_id = rec
+        .session_id
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let title = scrub(
+        store,
         &rec.task
             .clone()
             .unwrap_or_else(|| "agent session".to_string()),
@@ -431,12 +456,7 @@ pub fn capture(store: &Store, rec: &SessionRecord, clock: &dyn Clock) -> Result<
     // Deterministic identity from harness:session_id, so re-capturing the same
     // session (a retried SessionEnd hook, or a manual re-run) is idempotent and
     // never duplicates the summary or its markers.
-    let sig = crate::util::fnv1a64_hex(format!("{}:{}", rec.harness, session_id).as_bytes());
-    let summary_id = format!(
-        "session-summary-{}-{}",
-        crate::store::slugify(&title),
-        &sig[..8]
-    );
+    let summary_id = summary_id_for(store, rec);
     let summary = match store.create_with_id(
         &summary_id,
         &NewMemory {
@@ -459,7 +479,7 @@ pub fn capture(store: &Store, rec: &SessionRecord, clock: &dyn Clock) -> Result<
     created.push(summary);
 
     for (mtype, text) in &rec.markers {
-        let text = scrub(text);
+        let text = scrub(store, text);
         let mhash = crate::util::fnv1a64_hex(format!("{summary_id}:{text}").as_bytes());
         let marker_id = format!(
             "{}-{}-{}",
@@ -508,6 +528,84 @@ pub fn capture_file(
     let mut rec = parse(&text, format, harness, core);
     rec.scope = scope.map(str::to_string);
     capture(store, &rec, clock)
+}
+
+/// Capture, then also write distilled candidates. Runs [`capture`] first (the
+/// summary + explicit markers), then the `distiller` over the raw transcript,
+/// creating each candidate memory linked to the session summary. Idempotent:
+/// candidate ids are derived from the summary id + scrubbed content, so a
+/// re-capture (even one where the summary already existed) adds nothing new.
+///
+/// Redaction ordering: the distiller sees the un-redacted `text`, but every
+/// candidate is written through the store's redacting write path, so a secret
+/// echoed in the transcript is scrubbed out of the stored candidate — as with
+/// markers, the id-forming content is scrubbed before it is slugified.
+pub fn capture_with_distill(
+    store: &Store,
+    text: &str,
+    rec: &SessionRecord,
+    distiller: &dyn crate::distill::Distiller,
+    clock: &dyn Clock,
+) -> Result<Vec<Memory>> {
+    let mut created = capture(store, rec, clock)?;
+    // Link candidates to the summary whether it was just created or already
+    // existed (idempotent re-capture returns an empty `created`).
+    let summary_id = summary_id_for(store, rec);
+    for cand in distiller.distill(text, rec) {
+        let title = scrub(store, &cand.title);
+        // Salt the hash so a distilled candidate never collides with a marker
+        // of identical text.
+        let chash = crate::util::fnv1a64_hex(format!("distill:{summary_id}:{title}").as_bytes());
+        let cand_id = format!(
+            "{}-{}-{}",
+            cand.mtype.as_str(),
+            crate::store::slugify(&title),
+            &chash[..8]
+        );
+        if let Some(m) = store.create_with_id(
+            &cand_id,
+            &NewMemory {
+                mtype: Some(cand.mtype),
+                title: cap_chars(&title, 100),
+                tags: cand.tags.clone(),
+                harness: Some(rec.harness.clone()),
+                core: rec.core.clone(),
+                scope: rec.scope.clone(),
+                rationale: cand.rationale.clone(),
+                links: vec![summary_id.clone()],
+                body: cand.body.clone(),
+                ..NewMemory::default()
+            },
+            clock,
+        )? {
+            created.push(m);
+        }
+    }
+    Ok(created)
+}
+
+/// Read a transcript file and capture it with distillation ([`capture_with_
+/// distill`]). Mirrors [`capture_file`] but threads a `distiller`.
+#[allow(clippy::too_many_arguments)]
+pub fn capture_file_with_distill(
+    store: &Store,
+    path: &str,
+    format: Option<Format>,
+    harness: Option<&str>,
+    core: Option<&str>,
+    scope: Option<&str>,
+    distiller: &dyn crate::distill::Distiller,
+    clock: &dyn Clock,
+) -> Result<Vec<Memory>> {
+    let text = std::fs::read_to_string(path).map_err(|e| Error::Io {
+        context: "reading session transcript".to_string(),
+        path: path.to_string(),
+        source: e,
+    })?;
+    let format = format.unwrap_or_else(|| detect_format(&text));
+    let mut rec = parse(&text, format, harness, core);
+    rec.scope = scope.map(str::to_string);
+    capture_with_distill(store, &text, &rec, distiller, clock)
 }
 
 #[cfg(test)]
@@ -670,6 +768,53 @@ mod tests {
             "{:?}",
             marker.title
         );
+    }
+
+    #[test]
+    fn capture_with_distill_writes_candidates_linked_to_the_summary() {
+        use crate::distill::HeuristicDistiller;
+        let tmp = TempDir::new("capture-distill");
+        let store = Store::open(tmp.path());
+        // A transcript with a decision the session never flagged with a marker.
+        let text = "help me choose\nWe chose DuckDB over Postgres for the analytics store today.\nAlways run verify.sh before you commit.\n";
+        let rec = parse(text, Format::Generic, Some("hermes"), None);
+        let created =
+            capture_with_distill(&store, text, &rec, &HeuristicDistiller, &FixedClock(T0)).unwrap();
+        // summary + 2 distilled candidates (no explicit markers here).
+        assert_eq!(created.len(), 3, "{created:#?}");
+        assert_eq!(created[0].mtype, MemoryType::SessionSummary);
+        let decision = created
+            .iter()
+            .find(|m| m.mtype == MemoryType::Decision)
+            .expect("a distilled decision");
+        assert!(decision.links.contains(&created[0].id), "linked to summary");
+        assert!(decision.tags.contains(&"distilled".to_string()));
+        assert!(created.iter().any(|m| m.mtype == MemoryType::Rule));
+
+        // Idempotent: a second run over the same session adds nothing.
+        let again =
+            capture_with_distill(&store, text, &rec, &HeuristicDistiller, &FixedClock(T0)).unwrap();
+        assert!(again.is_empty(), "re-capture is a no-op: {again:#?}");
+    }
+
+    #[test]
+    fn distilled_candidate_secret_is_redacted_before_disk() {
+        // A distilled decision whose text echoes a fake token must be scrubbed
+        // on write, exactly like a marker. Obviously-fake secret.
+        use crate::distill::HeuristicDistiller;
+        let tmp = TempDir::new("capture-distill-redact");
+        let store = Store::open(tmp.path());
+        let fake = format!("ghp_{}", "z".repeat(36));
+        let text = format!("We chose to rotate the leaked key {fake} immediately today.\n");
+        let rec = parse(&text, Format::Generic, Some("hermes"), None);
+        let created =
+            capture_with_distill(&store, &text, &rec, &HeuristicDistiller, &FixedClock(T0))
+                .unwrap();
+        for m in &created {
+            let path = store.memories_dir().join(format!("{}.md", m.id));
+            let disk = std::fs::read_to_string(&path).unwrap();
+            assert!(!disk.contains("ghp_"), "secret leaked into {}", m.id);
+        }
     }
 
     #[test]
