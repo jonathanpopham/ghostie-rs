@@ -15,6 +15,7 @@
 
 use crate::error::{Error, Result, Warning};
 use crate::json::{self, Value};
+use crate::recall::embed;
 use crate::recall::tokenize::tokenize;
 use crate::store::Store;
 use crate::store::memory::{Memory, MemoryType};
@@ -25,8 +26,10 @@ use std::path::{Path, PathBuf};
 /// Bump when the on-disk index schema changes (old indexes are rebuilt).
 /// v2 adds `links` (the recall graph edges, for Personalized PageRank) and
 /// provenance (`harness`/`core`/`rationale`/`scope`) so recall renders cards
-/// without re-reading files.
-pub const FORMAT_VERSION: i64 = 2;
+/// without re-reading files. v3 adds the corpus `term_embed` cache: every
+/// unique indexed term's hashed-subword embedding, computed once at index
+/// build time so the semantic rerank does not recompute it on every query.
+pub const FORMAT_VERSION: i64 = 3;
 
 /// The three scored fields, in canonical order. Array positions in
 /// [`DocEntry::tf`] and [`DocEntry::field_len`] follow this order.
@@ -75,6 +78,15 @@ pub struct DocEntry {
 pub struct Index {
     /// Entries keyed by memory id (BTreeMap: deterministic iteration).
     pub docs: BTreeMap<String, DocEntry>,
+    /// Corpus-wide per-term embedding cache: every unique indexed term mapped
+    /// to its hashed-subword [`embed::Embedding`]. An embedding is a PURE
+    /// function of its term string, so this is a derivable cache — recomputing
+    /// it yields byte-identical vectors, and dropping it never changes recall
+    /// output (only speed). Persisted so the semantic rerank reads it instead
+    /// of re-hashing every term's char n-grams on each query. Always kept
+    /// complete (one entry per term in some doc's `tf`) by
+    /// [`Index::refresh_term_embed`].
+    pub term_embed: BTreeMap<String, embed::Embedding>,
 }
 
 impl Index {
@@ -114,6 +126,29 @@ impl Index {
         }
     }
 
+    /// (Re)populate [`Index::term_embed`] from the current docs. Reuses any
+    /// vector already cached under the same term (an embedding is a pure
+    /// function of its term, so a cached vector is bit-for-bit identical to a
+    /// freshly computed one — reuse can never diverge) and computes the rest.
+    /// Terms no longer present in any doc are dropped, so the cache stays
+    /// exactly the corpus term set and the index stays byte-stable.
+    fn refresh_term_embed(&mut self) {
+        let mut old = std::mem::take(&mut self.term_embed);
+        let mut fresh: BTreeMap<String, embed::Embedding> = BTreeMap::new();
+        for entry in self.docs.values() {
+            for term in entry.tf.keys() {
+                if fresh.contains_key(term) {
+                    continue;
+                }
+                let e = old
+                    .remove(term)
+                    .unwrap_or_else(|| embed::embed_terms(std::slice::from_ref(term)));
+                fresh.insert(term.clone(), e);
+            }
+        }
+        self.term_embed = fresh;
+    }
+
     /// Build a fresh index from every readable memory file. Unreadable
     /// files become warnings (and are simply absent from the index).
     pub fn build(store: &Store) -> Result<(Index, Vec<Warning>)> {
@@ -127,7 +162,12 @@ impl Index {
             })?;
             docs.insert(m.id.clone(), Index::entry_for(m, rel_path(path), &bytes));
         }
-        Ok((Index { docs }, warnings))
+        let mut index = Index {
+            docs,
+            term_embed: BTreeMap::new(),
+        };
+        index.refresh_term_embed();
+        Ok((index, warnings))
     }
 
     /// Load the index and re-index anything stale (hash mismatch), missing
@@ -136,7 +176,7 @@ impl Index {
     /// warning, never an error).
     pub fn ensure_fresh(store: &Store) -> Result<(Index, Vec<Warning>)> {
         let mut warnings = Vec::new();
-        let loaded = match Index::load(store.root()) {
+        let mut loaded = match Index::load(store.root()) {
             Ok(Some(idx)) => idx,
             Ok(None) => Index::default(),
             Err(e) => {
@@ -173,6 +213,12 @@ impl Index {
         if loaded.docs.len() != fresh.docs.len() {
             changed = true; // deletions
         }
+        // Carry the loaded embedding cache forward, then complete it: surviving
+        // terms reuse their cached vector (no recompute), new terms are
+        // embedded once, dropped terms fall away. Pure function of the term, so
+        // this stays byte-identical to a from-scratch rebuild.
+        fresh.term_embed = std::mem::take(&mut loaded.term_embed);
+        fresh.refresh_term_embed();
         if changed && let Err(e) = fresh.save(store.root()) {
             warnings.push(Warning {
                 origin: index_path(store.root()).display().to_string(),
@@ -281,6 +327,23 @@ impl Index {
             .map(|(t, n)| (t, Value::int(n)))
             .collect();
         let totals = self.total_field_len();
+        // Per-term embedding cache: term -> { bucket -> weight }. Buckets are
+        // small non-negative integers rendered as string keys; sorted_object
+        // keeps every level deterministic (integers only, no floats).
+        let term_embed_pairs: Vec<(String, Value)> = self
+            .term_embed
+            .iter()
+            .map(|(term, emb)| {
+                (
+                    term.clone(),
+                    Value::sorted_object(
+                        emb.iter()
+                            .map(|(bucket, weight)| (bucket.to_string(), Value::int(*weight)))
+                            .collect(),
+                    ),
+                )
+            })
+            .collect();
         let corpus = Value::sorted_object(vec![
             ("doc_count".to_string(), Value::int(self.doc_count())),
             ("df".to_string(), Value::Object(df_pairs)), // BTreeMap: sorted
@@ -293,6 +356,10 @@ impl Index {
                         .map(|(i, name)| ((*name).to_string(), Value::int(totals[i])))
                         .collect(),
                 ),
+            ),
+            (
+                "term_embed".to_string(),
+                Value::sorted_object(term_embed_pairs),
             ),
         ]);
         let doc = Value::sorted_object(vec![
@@ -437,7 +504,37 @@ impl Index {
                 },
             );
         }
-        Ok(Some(Index { docs }))
+        // Corpus term-embedding cache (term -> { bucket -> weight }). Absent on
+        // a corrupt/partial index; ensure_fresh completes it either way, since
+        // the embedding is a pure function of the term.
+        let mut term_embed: BTreeMap<String, embed::Embedding> = BTreeMap::new();
+        if let Some(cache) = v
+            .get("corpus")
+            .and_then(Value::as_object)
+            .and_then(|c| {
+                c.iter()
+                    .find(|(k, _)| k == "term_embed")
+                    .map(|(_, val)| val)
+            })
+            .and_then(Value::as_object)
+        {
+            for (term, buckets) in cache {
+                let mut emb = embed::Embedding::new();
+                if let Some(pairs) = buckets.as_object() {
+                    for (bucket, weight) in pairs {
+                        let b: u32 = bucket.parse().map_err(|_| {
+                            bad(&format!("term_embed '{term}': bad bucket '{bucket}'"))
+                        })?;
+                        let w = weight.as_i64().ok_or_else(|| {
+                            bad(&format!("term_embed '{term}': non-integer weight"))
+                        })?;
+                        emb.insert(b, w);
+                    }
+                }
+                term_embed.insert(term.clone(), emb);
+            }
+        }
+        Ok(Some(Index { docs, term_embed }))
     }
 }
 
@@ -637,6 +734,50 @@ mod tests {
         store.delete("fact-warm-entry-1").unwrap();
         let on_disk = Index::load(store.root()).unwrap().expect("index exists");
         assert!(!on_disk.docs.contains_key("fact-warm-entry-1"));
+    }
+
+    #[test]
+    fn term_embed_cache_equals_recompute() {
+        let tmp = TempDir::new("idx-embcache");
+        let store = Store::open(tmp.path());
+        seed(&store);
+        let (idx, _) = Index::build(&store).unwrap();
+        // The cache holds exactly the corpus term set...
+        let corpus_terms: std::collections::BTreeSet<&str> = idx
+            .docs
+            .values()
+            .flat_map(|e| e.tf.keys().map(String::as_str))
+            .collect();
+        assert_eq!(
+            idx.term_embed.len(),
+            corpus_terms.len(),
+            "one cache entry per unique indexed term"
+        );
+        // ...and every cached vector is byte-identical to recomputing it (the
+        // whole point: cached == recompute, so recall never diverges).
+        for (term, cached) in &idx.term_embed {
+            let recomputed = embed::embed_terms(std::slice::from_ref(term));
+            assert_eq!(cached, &recomputed, "cache diverged for term {term:?}");
+        }
+    }
+
+    #[test]
+    fn term_embed_cache_survives_save_load_and_reuse() {
+        let tmp = TempDir::new("idx-embcache-rt");
+        let store = Store::open(tmp.path());
+        seed(&store);
+        let (built, _) = Index::build(&store).unwrap();
+        built.save(store.root()).unwrap();
+        let loaded = Index::load(store.root()).unwrap().expect("index exists");
+        assert_eq!(
+            built.term_embed, loaded.term_embed,
+            "embedding cache round-trips through JSON byte-for-byte"
+        );
+        // Reuse path: an ensure_fresh over a warm index recomputes nothing yet
+        // yields the same cache and the same bytes as a from-scratch build.
+        let (fresh, _) = Index::ensure_fresh(&store).unwrap();
+        assert_eq!(fresh.term_embed, built.term_embed);
+        assert_eq!(fresh.to_json(), built.to_json());
     }
 
     #[test]

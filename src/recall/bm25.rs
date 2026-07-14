@@ -228,7 +228,10 @@ mod tests {
                 field_len: [1, 0, 2],
             },
         );
-        Index { docs }
+        Index {
+            docs,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -339,7 +342,13 @@ mod tests {
                 },
             );
         }
-        let hits = bm25_scores(&["gate".to_string()], &Index { docs });
+        let hits = bm25_scores(
+            &["gate".to_string()],
+            &Index {
+                docs,
+                ..Default::default()
+            },
+        );
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].id, "fact-a-1", "title hit outranks body hit");
         assert!(hits[0].score_micros > hits[1].score_micros);

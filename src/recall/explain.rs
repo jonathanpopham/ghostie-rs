@@ -263,7 +263,10 @@ mod tests {
                 field_len: [1, 0, 5],
             },
         );
-        Index { docs }
+        Index {
+            docs,
+            ..Default::default()
+        }
     }
 
     fn explain_query(q: &str) -> Explanation {

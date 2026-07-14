@@ -480,19 +480,17 @@ pub fn recall(store: &Store, query: &str, opts: &RecallOpts) -> Result<RecallRes
     //    (`sovereign` -> `sovereignty`) matches regardless of memory length.
     //    Boosts existing hits and pulls in memories reached by meaning alone.
     if opts.rerank && !query_terms.is_empty() {
-        // Embed each query token and each unique memory term once.
+        // Embed each query token once (query terms are ephemeral, not corpus
+        // members, so they are not cached).
         let q_embeds: Vec<embed::Embedding> = query_terms
             .iter()
             .map(|t| embed::embed_terms(std::slice::from_ref(t)))
             .collect();
-        let mut term_embed: BTreeMap<&str, embed::Embedding> = BTreeMap::new();
-        for entry in index.docs.values() {
-            for term in entry.tf.keys() {
-                term_embed
-                    .entry(term.as_str())
-                    .or_insert_with(|| embed::embed_terms(std::slice::from_ref(term)));
-            }
-        }
+        // Per-term memory embeddings come straight from the index cache
+        // (computed once at index-build time). An embedding is a pure function
+        // of its term, so this is byte-identical to recomputing here; the cache
+        // holds one entry per indexed term, so every `tf` key resolves.
+        let term_embed = &index.term_embed;
         // Max-sim semantic score per memory, computed once.
         let mut sim: BTreeMap<&str, i64> = BTreeMap::new();
         for (id, entry) in &index.docs {
@@ -674,6 +672,29 @@ mod tests {
             with_index.to_json().emit(),
             without_index.to_json().emit(),
             "the index is never authoritative — byte-equal results"
+        );
+    }
+
+    #[test]
+    fn cached_and_recomputed_rerank_are_byte_equal() {
+        // The semantic rerank reads per-term embeddings from the index cache.
+        // A first recall materializes the cache on disk; deleting the index
+        // forces the from-scratch recompute path. Because an embedding is a
+        // pure function of its term, both must produce byte-identical output —
+        // this is the guard that the cache never diverges from recompute.
+        let tmp = TempDir::new("recall-embcache-eq");
+        let store = Store::open(tmp.path());
+        seed(&store);
+        // A near-miss query that leans on the rerank (no whole-token match).
+        let q = "determinismic floating point";
+        let cached = recall(&store, q, &RecallOpts::default()).unwrap();
+        // The cache is on disk now; drop it and rebuild from files.
+        std::fs::remove_dir_all(store.root().join(".index")).unwrap();
+        let recomputed = recall(&store, q, &RecallOpts::default()).unwrap();
+        assert_eq!(
+            cached.to_json().emit(),
+            recomputed.to_json().emit(),
+            "cached term embeddings must match the recompute path byte-for-byte"
         );
     }
 

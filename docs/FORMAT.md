@@ -16,7 +16,13 @@ the gate loudly.
   `<id>.md`.
 - The derived index lives in `<root>/.index/index.json`. It is derivable
   data: rebuildable at any time from the memory files, never authoritative,
-  and excluded from sync.
+  and excluded from sync. Its `corpus.term_embed` block caches, per unique
+  indexed term, the hashed-subword embedding the semantic rerank uses (a map
+  of bucket to integer weight). Embeddings are a pure function of the term
+  string, so the cache is a speed optimization only: recomputing it yields
+  byte-identical vectors, and deleting the index never changes recall output.
+  The index `format_version` is bumped whenever this schema changes so older
+  indexes rebuild automatically.
 - Non-`.md` files and dotfiles inside `memories/` are ignored (humans keep
   notes; editors drop swap files).
 
