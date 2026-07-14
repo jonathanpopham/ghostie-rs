@@ -121,6 +121,37 @@ Point your client's MCP config at the `ghostie` binary. For a client that reads
 and the tool list); `ghostie mcp --json` emits it as a single JSON envelope, so
 a tool can discover the surface without starting the server.
 
+## Provenance thread
+
+Every memory write appends a deterministic, hash-chained record to
+`<store>/.provenance/log.jsonl`, so a memory's origin is verifiable and
+tamper-evident. Each record carries its sequence number, the previous record's
+hash (the chain link), the memory id, the event (`created`, `updated`, or
+`captured`), a content hash of the memory's exact bytes, the provenance fields
+(`source`, `harness`, `core`), and a timestamp from the injected clock. The
+entry hash is `fnv1a64(prev_hash + canonical_record_bytes)`, so any edit to a
+past record breaks the chain.
+
+```
+ghostie provenance <memory-id>   # show that memory's lineage
+ghostie provenance verify        # replay the whole chain -> INTACT or BROKEN
+```
+
+`verify` runs two checks and reports the first broken link by sequence number.
+The chain check recomputes each entry hash and confirms each record points at
+its predecessor, so an edited log record is caught. The content check rehashes
+each memory's live file against its last recorded content hash, so a memory
+edited outside the store API (a raw hand-edit, not a re-`update`) is caught. A
+broken chain exits non-zero, so a script or CI gate fails on tampering. To
+re-bless a deliberate hand-edit, write it back through an update so a fresh
+record chains onto the tail.
+
+The provenance log is the evidence, so it syncs with your memories through your
+own git remote. This is unlike the rebuildable `.index/`, which is gitignored.
+The lineage is the stack's clean, Lockstep-style story: deterministic evidence,
+black-box verifiable, tamper-evident, with zero parsing of anyone else's
+program. See `docs/PROVENANCE.md`.
+
 ## Secret-redaction gate
 
 Because your memory syncs to your own git remote, nothing secret should ever

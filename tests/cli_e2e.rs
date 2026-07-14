@@ -208,6 +208,7 @@ fn robot_mode_contract_for_every_subcommand() {
             "sync" => vec!["sync"],
             "hook" => vec!["hook", "status"],
             "mcp" => vec!["mcp"], // bare mcp prints the one-shot manifest (never `serve`)
+            "provenance" => vec!["provenance", "verify"], // replays the chain -> INTACT
             other => panic!("new subcommand '{other}' has no audit args — add them"),
         };
         let mut args = safe_args.clone();

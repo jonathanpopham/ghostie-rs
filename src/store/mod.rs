@@ -178,6 +178,7 @@ impl Store {
         };
         let memory = self.build_memory(id, mtype, new, clock);
         self.write_atomic(&memory)?;
+        self.append_provenance_best_effort(&memory, crate::provenance::Event::Created, clock);
         self.refresh_index_best_effort();
         Ok(memory)
     }
@@ -201,6 +202,7 @@ impl Store {
         }
         let memory = self.build_memory(id.to_string(), mtype, new, clock);
         self.write_atomic(&memory)?;
+        self.append_provenance_best_effort(&memory, crate::provenance::Event::Captured, clock);
         self.refresh_index_best_effort();
         Ok(Some(memory))
     }
@@ -312,6 +314,19 @@ impl Store {
         }
     }
 
+    /// Append a hash-chained provenance record for a just-persisted memory,
+    /// best-effort. A provenance-log failure must never lose the memory write,
+    /// so it is swallowed here exactly like the index refresh; the log is the
+    /// point (it syncs), and `ghostie provenance verify` surfaces any gap.
+    fn append_provenance_best_effort(
+        &self,
+        memory: &Memory,
+        event: crate::provenance::Event,
+        clock: &dyn Clock,
+    ) {
+        let _ = crate::provenance::append(&self.root, memory, event, clock);
+    }
+
     /// Read a memory by id.
     pub fn read(&self, id: &str) -> Result<(Memory, Vec<Warning>)> {
         self.read_path(&self.memory_path(id))
@@ -364,6 +379,15 @@ impl Store {
             });
         }
         self.write_atomic(memory)?;
+        // update() has no injected clock; resolve the process clock (honoring
+        // GHOSTIE_TEST_CLOCK for byte-stability), falling back to wall time.
+        let clock =
+            crate::util::resolve_clock().unwrap_or_else(|_| Box::new(crate::util::SystemClock));
+        self.append_provenance_best_effort(
+            memory,
+            crate::provenance::Event::Updated,
+            clock.as_ref(),
+        );
         self.refresh_index_best_effort();
         Ok(())
     }

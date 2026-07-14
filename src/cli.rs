@@ -31,8 +31,16 @@ use std::path::PathBuf;
 
 /// Subcommands implemented so far, in help order. The robot audit and the
 /// e2e suite iterate THIS list, so a new verb is auto-covered.
-pub const SUBCOMMANDS: [&str; 8] = [
-    "setup", "remember", "recall", "list", "capture", "sync", "hook", "mcp",
+pub const SUBCOMMANDS: [&str; 9] = [
+    "setup",
+    "remember",
+    "recall",
+    "list",
+    "capture",
+    "sync",
+    "hook",
+    "mcp",
+    "provenance",
 ];
 
 /// Everything a command run produces; `run` prints it, tests assert on it.
@@ -87,6 +95,9 @@ pub fn execute(args: &[String], stdin_body: Option<&str>) -> CliOutput {
         "sync" => wrap(command, &parsed, |store| cmd_sync(store, rest, json_mode)),
         "hook" => wrap(command, &parsed, |store| cmd_hook(store, rest, json_mode)),
         "mcp" => wrap(command, &parsed, |store| cmd_mcp(store, rest, json_mode)),
+        "provenance" => wrap(command, &parsed, |store| {
+            cmd_provenance(store, rest, json_mode)
+        }),
         "setup" => wrap(command, &parsed, |store| cmd_setup(store, rest, json_mode)),
         other => {
             let e = Error::Usage {
@@ -273,6 +284,7 @@ COMMANDS
   sync       sync the store via your own git remote (--init <remote> first)
   hook       auto-recall / auto-capture: `hook install`, `status`, `uninstall`
   mcp        serve ghostie as an MCP server (`mcp serve`) for any MCP client
+  provenance show a memory's lineage; `provenance verify` replays the chain
   help       this text; `ghostie help <command>` for details
   version    print the version
 
@@ -454,6 +466,30 @@ ghostie mcp [serve]
 EXIT CODES: 0 success · 1 failure · 2 bad arguments
 ";
 
+const HELP_PROVENANCE: &str = "\
+ghostie provenance <memory-id>
+ghostie provenance verify
+
+  Every memory write appends a deterministic, hash-chained record to
+  <store>/.provenance/log.jsonl, so a memory's origin is verifiable and
+  tamper-evident. The log syncs with your memories (it is the evidence), unlike
+  the rebuildable .index/.
+
+  <memory-id>   show that memory's lineage: each record's seq, event
+                (created | updated | captured), content hash, and provenance
+                (source, harness, core)
+  verify        replay the whole chain and report INTACT, or the first BROKEN
+                link by seq. Detects an edited log record (the entry hash no
+                longer matches) and an edited memory file (its bytes no longer
+                match the last recorded content hash)
+
+EXAMPLES
+  ghostie provenance fact-configs-live-in-etc-1
+  ghostie provenance verify --json
+
+EXIT CODES: 0 success (INTACT or a clean show) · 1 BROKEN chain or failure · 2 bad arguments
+";
+
 fn help(rest: &[String], json_mode: bool) -> CliOutput {
     let text = match rest.first().map(String::as_str) {
         Some("setup") => HELP_SETUP,
@@ -464,6 +500,7 @@ fn help(rest: &[String], json_mode: bool) -> CliOutput {
         Some("sync") => HELP_SYNC,
         Some("hook") => HELP_HOOK,
         Some("mcp") => HELP_MCP,
+        Some("provenance") => HELP_PROVENANCE,
         _ => HELP,
     };
     let mut out = CliOutput::default();
@@ -1531,6 +1568,77 @@ fn cmd_mcp(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, Er
         Some(other) => Err(usage(format!(
             "unknown mcp subcommand '{other}' (serve, or no argument for the manifest)"
         ))),
+    }
+}
+
+/// `provenance <id>` shows a memory's hash-chained lineage; `provenance verify`
+/// replays the whole chain and reports INTACT (exit 0) or the first BROKEN link
+/// (exit 1, so a script or CI gate fails on tampering). Robot `--json` on both.
+fn cmd_provenance(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, Error> {
+    use crate::provenance::{self, VerifyReport};
+    let usage = |message: String| Error::Usage { message };
+    match rest.first().map(String::as_str) {
+        None => Err(usage(
+            "provenance needs a memory id, or `verify` to replay the chain".to_string(),
+        )),
+        Some("verify") => {
+            if rest.len() > 1 {
+                return Err(usage(format!(
+                    "provenance verify takes no arguments (got {:?})",
+                    &rest[1..]
+                )));
+            }
+            match provenance::verify(store.root())? {
+                VerifyReport::Intact { entries, memories } => Ok(CmdOk {
+                    data: Value::Object(vec![
+                        ("status".to_string(), Value::string("intact")),
+                        ("entries".to_string(), Value::int(entries as i64)),
+                        ("memories".to_string(), Value::int(memories as i64)),
+                    ]),
+                    human: format!(
+                        "provenance INTACT: {entries} record(s) across {memories} memory(ies)\n"
+                    ),
+                    warnings: Vec::new(),
+                }),
+                // A broken chain is an operational failure (exit 1): scripts and
+                // the CI gate must fail on tampering, not read a success envelope.
+                VerifyReport::Broken { seq, reason } => Err(Error::Invalid {
+                    origin: provenance::log_path(store.root()).display().to_string(),
+                    message: format!("provenance BROKEN at seq {seq}: {reason}"),
+                }),
+            }
+        }
+        Some(flag) if flag.starts_with('-') => {
+            Err(usage(format!("unknown flag '{flag}' for provenance")))
+        }
+        Some(id) => {
+            let entries = provenance::lineage(store.root(), id)?;
+            let items: Vec<Value> = entries.iter().map(provenance::Entry::to_json).collect();
+            let mut human = if entries.is_empty() {
+                format!("no provenance recorded for {id}\n")
+            } else {
+                format!("provenance for {id} ({} record(s)):\n", entries.len())
+            };
+            for e in &entries {
+                human.push_str(&format!(
+                    "  seq {:>3}  {:<9}  content {}  entry {}  {}\n",
+                    e.seq,
+                    e.event.as_str(),
+                    e.content_hash,
+                    e.entry_hash,
+                    format_rfc3339_utc(e.created),
+                ));
+            }
+            Ok(CmdOk {
+                data: Value::Object(vec![
+                    ("memory_id".to_string(), Value::string(id)),
+                    ("entries".to_string(), Value::Array(items)),
+                    ("count".to_string(), Value::int(entries.len() as i64)),
+                ]),
+                human,
+                warnings: Vec::new(),
+            })
+        }
     }
 }
 
