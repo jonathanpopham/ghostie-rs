@@ -161,7 +161,10 @@ mod tests {
         for n in nodes {
             docs.insert(n.id.clone(), n);
         }
-        Index { docs }
+        Index {
+            docs,
+            ..Default::default()
+        }
     }
 
     #[test]
