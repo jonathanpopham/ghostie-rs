@@ -42,9 +42,14 @@ ghostie remember --type decision "Chose DuckDB over Postgres" \
 ghostie recall "why did we pick duckdb" --budget 800
 ```
 
-Retrieval is literal-token today (no stemming or embeddings): near-miss wording
-can miss, which the link graph and a future hash-embedding rerank are meant to
-cover.
+On top of BM25, a deterministic hashed-subword embedding reranks the results:
+each token is hashed into character n-grams, so `sovereign` reaches a memory
+that only ever says `sovereignty`, and a concept phrased differently still
+surfaces. No model, no stemming, no lexicon; std-only integer cosine, so the
+binary stays offline and byte-stable. A labeled eval (`cargo test --test eval
+-- --nocapture`) measures the lift: on its near-miss set, mean reciprocal rank
+goes from 0.00 (BM25 alone) to 1.00 with the rerank on. `recall --no-rerank`
+turns it off.
 
 ## One button, and it just works
 

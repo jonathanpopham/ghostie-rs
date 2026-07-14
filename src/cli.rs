@@ -326,6 +326,7 @@ ghostie recall \"<task or question>\" [-k N] [--type t] [--tag t]
   --budget <N>  cap the result at ~N tokens; packs the best cards and stops,
                 so a context-injection hook never floods (top card always kept)
   --diverse     demote near-duplicate memories (MMR); pairs well with --budget
+  --no-rerank   disable the semantic (hashed-embedding) rerank; BM25 only
 
   Hits reached through the link graph (Personalized PageRank) rather than by
   word match are labelled \"reached via link from <id>\".
@@ -800,6 +801,9 @@ fn cmd_recall(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk,
             }
             "--diverse" => {
                 opts.diversify = true;
+            }
+            "--no-rerank" => {
+                opts.rerank = false;
             }
             a if a.starts_with('-') => {
                 return Err(usage(format!("unknown flag '{a}' for recall")));

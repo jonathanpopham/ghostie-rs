@@ -14,6 +14,7 @@
 //! order (score desc, id asc) -> pack under the token budget -> top-k.
 
 pub mod bm25;
+pub mod embed;
 pub mod explain;
 pub mod ppr;
 pub mod tokenize;
@@ -21,7 +22,7 @@ pub mod tokenize;
 use crate::error::{Result, Warning};
 use crate::json::Value;
 use crate::recall::bm25::bm25_scores;
-use crate::recall::explain::{Explanation, ignored_terms};
+use crate::recall::explain::{Explanation, RerankExplanation, ignored_terms};
 use crate::store::Store;
 use crate::store::index::Index;
 use crate::store::memory::MemoryType;
@@ -52,6 +53,11 @@ pub struct RecallOpts {
     /// Off by default (pure relevance order); most useful with `budget_tokens`
     /// when a hook injects a handful of cards and each one should earn its slot.
     pub diversify: bool,
+    /// Blend a hashed-subword embedding cosine into the ranking: boosts hits
+    /// that are semantically close and surfaces near-miss / concept matches
+    /// that share no whole token (`sovereign` -> `sovereignty`). On by default;
+    /// the eval harness flips it off to measure the lift.
+    pub rerank: bool,
 }
 
 impl Default for RecallOpts {
@@ -64,6 +70,7 @@ impl Default for RecallOpts {
             scope: None,
             budget_tokens: None,
             diversify: false,
+            rerank: true,
         }
     }
 }
@@ -147,6 +154,22 @@ impl RecallHit {
                 "why: reached via link from {} (graph {})",
                 via,
                 render_micros(self.graph_micros)
+            );
+        }
+        // Semantic-only hit: no lexical terms, reached by embedding similarity.
+        if self.explanation.matched_terms.is_empty()
+            && let Some(r) = &self.explanation.rerank
+            && r.embed_sim_micros > 0
+        {
+            let via = if r.shared_subtokens.is_empty() {
+                String::new()
+            } else {
+                format!(" via {}", r.shared_subtokens.join(", "))
+            };
+            return format!(
+                "why: semantically similar (embed {}){}",
+                render_micros(r.embed_sim_micros),
+                via
             );
         }
         self.explanation.render_human()
@@ -285,6 +308,49 @@ fn mmr_reorder(hits: Vec<RecallHit>, index: &Index) -> Vec<RecallHit> {
     order.into_iter().map(|i| hits[i].clone()).collect()
 }
 
+/// Embedding boost weight on an existing hit: `score += cosine * NUM/DEN`.
+/// Half-weight keeps a strong BM25 hit on top while letting the embedding
+/// reorder near-ties and lift semantically-close memories.
+const BETA_NUM: i64 = 1;
+const BETA_DEN: i64 = 2;
+/// A memory reached ONLY by embedding similarity must clear this cosine floor
+/// (0.35) to enter the results, so faint semantic echoes do not flood.
+const SEMANTIC_FLOOR: i64 = 350_000;
+
+/// Assemble the rerank breakdown for the explanation schema.
+fn rerank_expl(bm25_micros: i64, embed_sim_micros: i64, shared: Vec<String>) -> RerankExplanation {
+    RerankExplanation {
+        bm25_micros,
+        embed_sim_micros,
+        alpha_micros: embed::SCALE, // BM25 kept at full weight
+        beta_micros: embed::SCALE * BETA_NUM / BETA_DEN,
+        shared_subtokens: shared,
+    }
+}
+
+/// The query terms that overlap this memory's terms as subwords (a query term
+/// that contains, or is contained by, a doc term, both length >= 3), up to
+/// three: the words that carried the semantic match, for the explanation.
+fn shared_subtokens(query_terms: &[String], entry: &crate::store::index::DocEntry) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for qt in query_terms {
+        if qt.len() < 3 {
+            continue;
+        }
+        let overlaps = entry
+            .tf
+            .keys()
+            .any(|dt| dt.len() >= 3 && (dt.contains(qt.as_str()) || qt.contains(dt.as_str())));
+        if overlaps && !out.contains(qt) {
+            out.push(qt.clone());
+            if out.len() == 3 {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Does this memory pass the mtype/tag/scope filters? Applied while
 /// assembling, so filters never starve a later result. A memory with no
 /// scope is `global` and passes any scope filter.
@@ -406,6 +472,92 @@ pub fn recall(store: &Store, query: &str, opts: &RecallOpts) -> Result<RecallRes
             core: entry.core.clone(),
             explanation: Explanation::graph_reached(&ignored),
         });
+    }
+
+    // 3. Semantic rerank via hashed subword embeddings (deterministic, no
+    //    model). A memory's semantic score is the average, over query tokens,
+    //    of the BEST cosine to any single memory term, so a near-miss word
+    //    (`sovereign` -> `sovereignty`) matches regardless of memory length.
+    //    Boosts existing hits and pulls in memories reached by meaning alone.
+    if opts.rerank && !query_terms.is_empty() {
+        // Embed each query token and each unique memory term once.
+        let q_embeds: Vec<embed::Embedding> = query_terms
+            .iter()
+            .map(|t| embed::embed_terms(std::slice::from_ref(t)))
+            .collect();
+        let mut term_embed: BTreeMap<&str, embed::Embedding> = BTreeMap::new();
+        for entry in index.docs.values() {
+            for term in entry.tf.keys() {
+                term_embed
+                    .entry(term.as_str())
+                    .or_insert_with(|| embed::embed_terms(std::slice::from_ref(term)));
+            }
+        }
+        // Max-sim semantic score per memory, computed once.
+        let mut sim: BTreeMap<&str, i64> = BTreeMap::new();
+        for (id, entry) in &index.docs {
+            let mut total: i64 = 0;
+            for qe in &q_embeds {
+                let best = entry
+                    .tf
+                    .keys()
+                    .filter_map(|t| term_embed.get(t.as_str()))
+                    .map(|te| embed::cosine_micros(qe, te))
+                    .max()
+                    .unwrap_or(0);
+                total += best;
+            }
+            let c = total / q_embeds.len() as i64;
+            if c > 0 {
+                sim.insert(id.as_str(), c);
+            }
+        }
+        let present: BTreeSet<String> = hits.iter().map(|h| h.id.clone()).collect();
+        // Boost the hits already found, and record the blend breakdown.
+        for h in &mut hits {
+            let c = sim.get(h.id.as_str()).copied().unwrap_or(0);
+            let bm25 = if h.graph_via.is_some() {
+                0
+            } else {
+                h.score_micros
+            };
+            h.score_micros = h.score_micros.saturating_add(c * BETA_NUM / BETA_DEN);
+            let shared = index
+                .docs
+                .get(&h.id)
+                .map(|e| shared_subtokens(&query_terms, e))
+                .unwrap_or_default();
+            h.explanation.rerank = Some(rerank_expl(bm25, c, shared));
+        }
+        // New semantic candidates: reached by meaning alone, above the floor.
+        for (id, &c) in &sim {
+            if present.contains(*id) || c < SEMANTIC_FLOOR {
+                continue;
+            }
+            let entry = &index.docs[*id];
+            if !passes_filters(entry, opts) {
+                continue;
+            }
+            if opts.min_score_micros > 0 && c < opts.min_score_micros {
+                continue;
+            }
+            let mut explanation = Explanation::graph_reached(&ignored);
+            explanation.rerank = Some(rerank_expl(0, c, shared_subtokens(&query_terms, entry)));
+            hits.push(RecallHit {
+                id: id.to_string(),
+                mtype: entry.mtype,
+                title: entry.title.clone(),
+                created: entry.created,
+                path: entry.path.clone(),
+                score_micros: c,
+                graph_micros: 0,
+                graph_via: None,
+                rationale: entry.rationale.clone(),
+                harness: entry.harness.clone(),
+                core: entry.core.clone(),
+                explanation,
+            });
+        }
     }
 
     // Total order: score desc, id asc (stable, deterministic).

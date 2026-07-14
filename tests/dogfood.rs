@@ -146,8 +146,15 @@ fn labeled_queries_hit_their_expected_memories() {
                 );
                 continue;
             }
+            // A semantic-only hit (reached by embedding similarity) also has no
+            // lexical terms; its why is the embedding cosine in the rerank slot.
+            let semantic = h.explanation.matched_terms.is_empty()
+                && h.explanation
+                    .rerank
+                    .as_ref()
+                    .is_some_and(|r| r.embed_sim_micros > 0);
             assert!(
-                !h.explanation.matched_terms.is_empty(),
+                !h.explanation.matched_terms.is_empty() || semantic,
                 "{query:?}: hit {} has an empty why",
                 h.id
             );

@@ -86,13 +86,11 @@ dogfood(){
       continue
     fi
     # Rank 1 = first element of the hits array (compact JSON, stable).
+    # (Per-hit why validity -- lexical vs graph vs semantic -- is exhaustively
+    # checked in cargo tests/dogfood.rs; here we only assert rank-1, since
+    # graph and embedding-reached hits legitimately carry empty matched_terms.)
     if [[ "$out" == *"\"hits\":[{\"id\":\"$want\""* ]]; then
-      # Non-empty why on every hit: no empty matched_terms anywhere.
-      if [[ "$out" == *'"matched_terms":[]'* ]]; then
-        echo "  FAIL query: $query"; echo "    rank-1 ok but an empty why surfaced"; bad=$((bad+1))
-      else
-        echo "  PASS query: $query -> $want"; ok=$((ok+1))
-      fi
+      echo "  PASS query: $query -> $want"; ok=$((ok+1))
     else
       echo "  FAIL query: $query"
       echo "    expected rank 1: $want"
