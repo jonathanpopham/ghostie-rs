@@ -1248,8 +1248,7 @@ fn cmd_hook(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
                         let notify_arg = rest
                             .iter()
                             .skip(2)
-                            .filter(|a| !a.starts_with("--"))
-                            .next_back()
+                            .rfind(|a| !a.starts_with("--"))
                             .map(String::as_str);
                         hook::run_capture_codex_notify(
                             store,
