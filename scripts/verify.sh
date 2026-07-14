@@ -186,6 +186,9 @@ guard_robot_mode(){
       capture)  out="$("$BIN" --store "$store" capture "$store/t.jsonl" --json || true)" ;;
       sync)     out="$("$BIN" --store "$store" sync --json || true)" ;;
       hook)     out="$(HOME="$home" "$BIN" --store "$store" hook status --json || true)" ;;
+      # Bare `mcp` prints a one-shot manifest and exits; NEVER `mcp serve`,
+      # which is a long-running stdin loop and would block the audit.
+      mcp)      out="$("$BIN" --store "$store" mcp --json || true)" ;;
       *) echo "  new subcommand '$sub' has no robot audit case — add one"; return 1 ;;
     esac
     if [ -z "$out" ] || [ "${out:0:1}" != "{" ] || [ "$(printf '%s\n' "$out" | wc -l)" -ne 1 ]; then
