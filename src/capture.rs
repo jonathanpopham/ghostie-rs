@@ -93,10 +93,23 @@ pub fn detect_format(text: &str) -> Format {
                 if v.get("sessionId").is_some() {
                     return Format::ClaudeCode;
                 }
+                // Real Codex rollout: `{type: session_meta|response_item|
+                // turn_context|event_msg, payload: {...}}`.
+                let kind = v.get("type").and_then(Value::as_str);
+                if v.get("payload").is_some()
+                    && matches!(
+                        kind,
+                        Some("session_meta")
+                            | Some("response_item")
+                            | Some("turn_context")
+                            | Some("event_msg")
+                    )
+                {
+                    return Format::Codex;
+                }
                 if v.get("message").is_some()
                     || v.get("role").is_some()
                     || v.get("content").is_some()
-                    || v.get("record_type").is_some()
                 {
                     saw_structured = true;
                 }
@@ -121,9 +134,94 @@ pub fn parse(
 ) -> SessionRecord {
     match format {
         Format::ClaudeCode => parse_structured(text, format, harness, core, &["sessionId"]),
-        Format::Codex => parse_structured(text, format, harness, core, &["session_id", "id"]),
+        Format::Codex => parse_codex(text, harness, core),
         Format::Generic => parse_generic(text, format, harness, core),
     }
+}
+
+/// Codex injects `<user_instructions>` and `<environment_context>` as the
+/// first "user" messages; skip them when choosing the task.
+fn is_real_user_text(t: &str) -> bool {
+    let s = t.trim_start();
+    !s.is_empty()
+        && !s.starts_with("<user_instructions>")
+        && !s.starts_with("<environment_context>")
+}
+
+/// Parse a Codex rollout JSONL (verified against real `~/.codex` output).
+/// Each line wraps a `payload`: `session_meta` carries the session id,
+/// `turn_context` the model, and `response_item` a message (role + content
+/// blocks of `input_text` / `output_text`). The duplicate `event_msg` /
+/// `user_message` lines are ignored so a prompt is not counted twice. Lines
+/// with a top-level `role`/`content` (simpler tools) are handled too.
+fn parse_codex(text: &str, harness: Option<&str>, core: Option<&str>) -> SessionRecord {
+    let mut rec = SessionRecord {
+        harness: harness
+            .unwrap_or(Format::Codex.default_harness())
+            .to_string(),
+        core: core.map(str::to_string),
+        ..SessionRecord::default()
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = json::parse(line) else {
+            continue;
+        };
+        let kind = v.get("type").and_then(Value::as_str);
+        let payload = v.get("payload");
+        match kind {
+            Some("session_meta") => {
+                if rec.session_id.is_none()
+                    && let Some(id) = payload.and_then(|p| p.get("id")).and_then(Value::as_str)
+                {
+                    rec.session_id = Some(id.to_string());
+                }
+            }
+            Some("turn_context") => {
+                if rec.core.is_none()
+                    && let Some(m) = payload.and_then(|p| p.get("model")).and_then(Value::as_str)
+                {
+                    rec.core = Some(m.to_string());
+                }
+            }
+            // `response_item` (payload-wrapped) OR a bare top-level message.
+            _ => {
+                let scope = payload.unwrap_or(&v);
+                if scope.get("type").and_then(Value::as_str) == Some("message")
+                    || scope.get("role").is_some()
+                {
+                    let role = scope.get("role").and_then(Value::as_str);
+                    if rec.core.is_none()
+                        && let Some(m) = scope.get("model").and_then(Value::as_str)
+                    {
+                        rec.core = Some(m.to_string());
+                    }
+                    if rec.session_id.is_none()
+                        && let Some(id) = v
+                            .get("session_id")
+                            .or_else(|| v.get("id"))
+                            .and_then(Value::as_str)
+                    {
+                        rec.session_id = Some(id.to_string());
+                    }
+                    let content = collect_text(scope.get("content"));
+                    if matches!(role, Some("user") | Some("assistant")) {
+                        rec.message_count += 1;
+                    }
+                    if rec.task.is_none() && role == Some("user") && is_real_user_text(&content) {
+                        rec.task = Some(one_line(&content));
+                    }
+                    for marker in scan_markers(&content) {
+                        rec.markers.push(marker);
+                    }
+                }
+            }
+        }
+    }
+    rec
 }
 
 /// Parse structured JSONL (Claude Code, Codex, and lookalikes). Role, model,
@@ -427,19 +525,40 @@ mod tests {
     }
 
     #[test]
-    fn detects_and_parses_codex_with_input_output_text() {
-        // Codex-style: role/content at top level, input_text/output_text blocks.
+    fn parses_real_codex_rollout_schema() {
+        // The verified ~/.codex rollout shape: payload-wrapped, session_meta /
+        // turn_context / response_item, with a duplicate event_msg line.
         let t = [
-            r#"{"session_id":"cx-9","role":"user","content":[{"type":"input_text","text":"port the ingest service"}]}"#,
-            r#"{"role":"assistant","model":"gpt-5.5","content":[{"type":"output_text","text":"ok\nMEMORY rule: keep the contract stable across the port"}]}"#,
+            r#"{"type":"session_meta","payload":{"id":"cx-1","cwd":"/tmp/proj","cli_version":"0.38.0"}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_instructions>house rules</user_instructions>"}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"port the ingest service"}]}}"#,
+            r#"{"type":"turn_context","payload":{"cwd":"/tmp/proj","model":"gpt-5.5"}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok\nMEMORY rule: keep the contract stable across the port"}]}}"#,
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"port the ingest service"}}"#,
         ]
         .join("\n");
         assert_eq!(detect_format(&t), Format::Codex);
         let rec = parse(&t, Format::Codex, None, None);
         assert_eq!(rec.harness, "codex");
-        assert_eq!(rec.session_id.as_deref(), Some("cx-9"));
-        assert_eq!(rec.core.as_deref(), Some("gpt-5.5"));
-        assert_eq!(rec.task.as_deref(), Some("port the ingest service"));
+        assert_eq!(
+            rec.session_id.as_deref(),
+            Some("cx-1"),
+            "session id from session_meta.payload.id"
+        );
+        assert_eq!(
+            rec.core.as_deref(),
+            Some("gpt-5.5"),
+            "model from turn_context.payload.model"
+        );
+        assert_eq!(
+            rec.task.as_deref(),
+            Some("port the ingest service"),
+            "the <user_instructions> injection is skipped when picking the task"
+        );
+        assert_eq!(
+            rec.message_count, 3,
+            "2 user + 1 assistant response_items; the duplicate event_msg is not counted"
+        );
         assert_eq!(
             rec.markers,
             vec![(
@@ -447,6 +566,16 @@ mod tests {
                 "keep the contract stable across the port".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn codex_parser_also_handles_bare_top_level_messages() {
+        // A simpler tool that puts role/content at the top level.
+        let t = r#"{"session_id":"s1","role":"user","model":"gpt-5.5","content":[{"type":"input_text","text":"do the thing"}]}"#;
+        let rec = parse(t, Format::Codex, None, None);
+        assert_eq!(rec.session_id.as_deref(), Some("s1"));
+        assert_eq!(rec.core.as_deref(), Some("gpt-5.5"));
+        assert_eq!(rec.task.as_deref(), Some("do the thing"));
     }
 
     #[test]

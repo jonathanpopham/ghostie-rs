@@ -366,13 +366,22 @@ EXIT CODES: 0 success · 1 failure · 2 bad arguments · 3 sync conflict
 ";
 
 const HELP_CAPTURE: &str = "\
-ghostie capture <transcript-path> [--harness h] [--core c]
+ghostie capture <transcript-path> [--format f] [--harness h] [--core c] [--scope s]
 
-  Distill an agent session log (Claude Code JSONL) into memories: a
-  session-summary carrying provenance, plus one memory for each
-  `MEMORY <type>: text` marker left in the transcript.
-  --harness <h>   override the recorded harness (claude-code | hermes | ...)
+  Distill an agent session log into memories: a session-summary carrying
+  provenance, plus one memory for each `MEMORY <type>: text` marker in the
+  transcript. Re-capturing the same session is idempotent.
+
+  --format <f>    auto (default) | claude-code | codex | generic
+                  auto sniffs the file; generic reads ANY text/markdown, so a
+                  harness without a bespoke parser still works via markers
+  --harness <h>   override the recorded harness (claude-code | codex | hermes)
   --core <c>      override the recorded model
+  --scope <s>     stamp a retrieval scope (global | project:<name>)
+
+EXAMPLES
+  ghostie capture ~/.codex/archived_sessions/rollout-*.jsonl
+  ghostie capture ~/.hermes/notes.md --harness hermes --format generic
 
 EXIT CODES: 0 success · 1 failure · 2 bad arguments
 ";
