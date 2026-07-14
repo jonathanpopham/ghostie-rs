@@ -31,11 +31,13 @@ use std::path::PathBuf;
 
 /// Subcommands implemented so far, in help order. The robot audit and the
 /// e2e suite iterate THIS list, so a new verb is auto-covered.
-pub const SUBCOMMANDS: [&str; 9] = [
+pub const SUBCOMMANDS: [&str; 11] = [
     "setup",
     "remember",
     "recall",
     "list",
+    "forget",
+    "prune",
     "capture",
     "sync",
     "hook",
@@ -88,6 +90,10 @@ pub fn execute(args: &[String], stdin_body: Option<&str>) -> CliOutput {
         }),
         "recall" => wrap(command, &parsed, |store| cmd_recall(store, rest, json_mode)),
         "list" => wrap(command, &parsed, |store| cmd_list(store, rest, json_mode)),
+        "forget" => wrap(command, &parsed, |store| {
+            cmd_forget(store, rest, stdin_body, json_mode)
+        }),
+        "prune" => wrap(command, &parsed, |store| cmd_prune(store, rest, json_mode)),
         "_recanon" => wrap(command, &parsed, cmd_recanon),
         "capture" => wrap(command, &parsed, |store| {
             cmd_capture(store, rest, json_mode)
@@ -280,6 +286,8 @@ COMMANDS
   remember   create a memory from the command line
   recall     query the store; ranked hits, each with a why
   list       enumerate memories deterministically
+  forget     delete a memory by id (confirm, or --force)
+  prune      archive memories whose confidence has decayed (dry-run default)
   capture    distill a session log into memories
   sync       sync the store via your own git remote (--init <remote> first)
   hook       auto-recall / auto-capture: `hook install`, `status`, `uninstall`
@@ -339,6 +347,10 @@ ghostie recall \"<task or question>\" [-k N] [--type t] [--tag t]
                 so a context-injection hook never floods (top card always kept)
   --diverse     demote near-duplicate memories (MMR); pairs well with --budget
   --no-rerank   disable the semantic (hashed-embedding) rerank; BM25 only
+  --decay       blend a mild confidence-decay prior: memories untouched for a
+                long time sink a little (default off; ranking otherwise unchanged)
+  --touch       mark the returned memories as used: restore full confidence and
+                reset their decay clock (revalidate what you just recalled)
 
   Hits reached through the link graph (Personalized PageRank) rather than by
   word match are labelled \"reached via link from <id>\".
@@ -364,6 +376,47 @@ EXAMPLES
   ghostie list --json
 
 EXIT CODES: 0 success · 1 failure · 2 bad arguments
+";
+
+const HELP_FORGET: &str = "\
+ghostie forget <id> [--force] [--json]
+
+  Delete one memory by id. Deletion is confirmed before it happens: in human
+  mode you are prompted (answer y/yes on stdin); pass --force to skip the
+  prompt. There are no tombstones: git history is the record of what was there.
+
+  --force   delete without the confirmation prompt (required in --json mode,
+            which is non-interactive)
+
+  In --json mode there is nobody to prompt, so --force is required; without it
+  you get a usage error rather than a surprise deletion.
+
+EXAMPLES
+  ghostie forget fact-configs-live-in-etc-1
+  ghostie forget fact-configs-live-in-etc-1 --force --json
+
+EXIT CODES: 0 deleted (or declined) · 1 no such memory / store failure · 2 bad arguments
+";
+
+const HELP_PRUNE: &str = "\
+ghostie prune [--dry-run] [--force] [--below <micros>] [--json]
+
+  Archive memories whose confidence has decayed below a floor, so a store that
+  grows for months does not flood recall with stale cruft. Confidence decays on
+  a half-life since a memory was last used; `recall --touch` (or re-remembering)
+  revalidates it. Archiving is not deleting: files move to <store>/archive/,
+  keeping their bytes and git history, they just leave memories/.
+
+  --dry-run       list what WOULD be archived and stop (the default: safe)
+  --force         actually move the below-floor memories into <store>/archive/
+  --below <micros>  confidence floor in micro-units (0..1000000); default 250000
+
+EXAMPLES
+  ghostie prune                       # dry-run: show the stale memories
+  ghostie prune --force               # archive them
+  ghostie prune --below 100000 --json # stricter floor, robot mode
+
+EXIT CODES: 0 success · 1 store failure · 2 bad arguments
 ";
 
 const HELP_SETUP: &str = "\
@@ -508,6 +561,8 @@ fn help(rest: &[String], json_mode: bool) -> CliOutput {
         Some("remember") => HELP_REMEMBER,
         Some("recall") => HELP_RECALL,
         Some("list") => HELP_LIST,
+        Some("forget") => HELP_FORGET,
+        Some("prune") => HELP_PRUNE,
         Some("capture") => HELP_CAPTURE,
         Some("sync") => HELP_SYNC,
         Some("hook") => HELP_HOOK,
@@ -799,6 +854,7 @@ fn cmd_recall(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk,
     let usage = |message: String| Error::Usage { message };
     let mut query: Option<String> = None;
     let mut opts = RecallOpts::default();
+    let mut touch = false;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -854,6 +910,18 @@ fn cmd_recall(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk,
             "--no-rerank" => {
                 opts.rerank = false;
             }
+            // Blend the confidence-decay prior. The reference clock is the
+            // injected process clock (honoring GHOSTIE_TEST_CLOCK), so recall
+            // stays deterministic and never reaches for an ambient wall clock.
+            "--decay" => {
+                opts.decay = true;
+                opts.now_epoch = Some(resolve_clock()?.now_epoch_seconds());
+            }
+            // Revalidate the recalled memories: restore full confidence and
+            // reset their decay clock after the results are produced.
+            "--touch" => {
+                touch = true;
+            }
             a if a.starts_with('-') => {
                 return Err(usage(format!("unknown flag '{a}' for recall")));
             }
@@ -871,6 +939,15 @@ fn cmd_recall(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk,
     }
     let query = query.ok_or_else(|| usage("a query is required".to_string()))?;
     let result = recall(store, &query, &opts)?;
+    // Revalidate what was recalled (opt-in): mark each returned memory used so
+    // its confidence is restored and its decay clock resets. Best-effort — a
+    // mark failure must never turn a successful recall into an error.
+    if touch {
+        let clock = resolve_clock()?;
+        for hit in &result.hits {
+            let _ = store.mark_used(&hit.id, clock.as_ref());
+        }
+    }
     // Human rendering: one block per hit.
     let mut human = String::new();
     if result.hits.is_empty() {
@@ -1015,6 +1092,191 @@ fn cmd_list(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, E
     ]);
     Ok(CmdOk {
         data,
+        human,
+        warnings,
+    })
+}
+
+// ---------- forget ----------
+
+/// Read a confirmation line: the injected `stdin_body` in tests, otherwise one
+/// line of real stdin. Empty/absent counts as "no".
+fn read_confirmation(stdin_body: Option<&str>) -> Result<String, Error> {
+    if let Some(s) = stdin_body {
+        return Ok(s.to_string());
+    }
+    let mut buf = String::new();
+    use std::io::BufRead;
+    std::io::stdin()
+        .lock()
+        .read_line(&mut buf)
+        .map_err(|e| Error::Io {
+            context: "reading confirmation from stdin".to_string(),
+            path: "<stdin>".to_string(),
+            source: e,
+        })?;
+    Ok(buf)
+}
+
+/// `forget <id> [--force]`: delete one memory. Confirmed before it happens
+/// (prompt on stdin in human mode; `--force` skips it). `--json` is
+/// non-interactive, so it requires `--force` — never a surprise delete.
+fn cmd_forget(
+    store: &Store,
+    rest: &[String],
+    stdin_body: Option<&str>,
+    json_mode: bool,
+) -> Result<CmdOk, Error> {
+    let usage = |message: String| Error::Usage { message };
+    let mut id: Option<String> = None;
+    let mut force = false;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--force" => force = true,
+            a if a.starts_with('-') => {
+                return Err(usage(format!("unknown flag '{a}' for forget")));
+            }
+            positional => {
+                if id.is_some() {
+                    return Err(usage(format!(
+                        "forget takes one memory id (unexpected extra {positional:?})"
+                    )));
+                }
+                id = Some(positional.to_string());
+            }
+        }
+        i += 1;
+    }
+    let id = id.ok_or_else(|| usage("forget requires a memory id".to_string()))?;
+    if !force {
+        // Robot mode cannot be prompted: demand --force rather than guess.
+        if json_mode {
+            return Err(usage(
+                "refusing to delete in --json mode without --force (robot mode is non-interactive)"
+                    .to_string(),
+            ));
+        }
+        let answer = read_confirmation(stdin_body)?;
+        let yes = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+        if !yes {
+            return Ok(CmdOk {
+                data: Value::Object(vec![
+                    ("id".to_string(), Value::string(id.clone())),
+                    ("deleted".to_string(), Value::Bool(false)),
+                ]),
+                human: format!("aborted: {id} was not deleted\n"),
+                warnings: Vec::new(),
+            });
+        }
+    }
+    store.delete(&id)?;
+    Ok(CmdOk {
+        data: Value::Object(vec![
+            ("id".to_string(), Value::string(id.clone())),
+            ("deleted".to_string(), Value::Bool(true)),
+            (
+                "path".to_string(),
+                Value::string(format!("memories/{id}.md")),
+            ),
+        ]),
+        human: format!("deleted {id}\n"),
+        warnings: Vec::new(),
+    })
+}
+
+// ---------- prune ----------
+
+/// `prune [--dry-run] [--force] [--below <micros>]`: archive memories whose
+/// confidence has decayed below a floor. Dry-run (the default) only lists;
+/// `--force` moves them into `<store>/archive/`. Deterministic: the decay
+/// clock is the injected process clock, the math is pure integer.
+fn cmd_prune(store: &Store, rest: &[String], _json_mode: bool) -> Result<CmdOk, Error> {
+    let usage = |message: String| Error::Usage { message };
+    let mut force = false;
+    let mut floor = crate::decay::DEFAULT_PRUNE_FLOOR_MICROS;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--dry-run" => force = false, // the default; accepted for clarity
+            "--force" => force = true,
+            "--below" => {
+                i += 1;
+                let v = rest
+                    .get(i)
+                    .ok_or_else(|| usage("--below requires a micro-unit integer".to_string()))?;
+                floor = v.parse::<i64>().map_err(|_| {
+                    usage(format!(
+                        "--below expects an integer (micros 0..1000000), got '{v}'"
+                    ))
+                })?;
+            }
+            a if a.starts_with('-') => {
+                return Err(usage(format!("unknown flag '{a}' for prune")));
+            }
+            positional => {
+                return Err(usage(format!(
+                    "unexpected argument {positional:?} for prune"
+                )));
+            }
+        }
+        i += 1;
+    }
+    let clock = resolve_clock()?;
+    let now = clock.now_epoch_seconds();
+    let half_life = crate::decay::DEFAULT_HALF_LIFE_SECS;
+    // store.list is id-sorted, so the prune order is deterministic.
+    let (memories, warnings) = store.list(&ListFilter::default())?;
+    let mut stale: Vec<(String, i64)> = Vec::new();
+    for m in &memories {
+        let base = m.confidence.unwrap_or(crate::decay::FULL_CONFIDENCE_MICROS);
+        let reference = m.last_used.unwrap_or(m.created);
+        let decayed = crate::decay::decayed_confidence_micros(base, reference, now, half_life);
+        if decayed < floor {
+            stale.push((m.id.clone(), decayed));
+        }
+    }
+    if force {
+        for (id, _) in &stale {
+            store.archive(id)?;
+        }
+    }
+    let items: Vec<Value> = stale
+        .iter()
+        .map(|(id, decayed)| {
+            Value::Object(vec![
+                ("id".to_string(), Value::string(id.clone())),
+                ("confidence".to_string(), Value::int(*decayed)),
+                ("archived".to_string(), Value::Bool(force)),
+            ])
+        })
+        .collect();
+    let human = if stale.is_empty() {
+        format!("no memories below confidence {floor}\n")
+    } else {
+        let mut h = if force {
+            format!(
+                "archived {} memory(ies) below confidence {floor}:\n",
+                stale.len()
+            )
+        } else {
+            format!(
+                "{} memory(ies) below confidence {floor} (dry-run; pass --force to archive):\n",
+                stale.len()
+            )
+        };
+        for (id, decayed) in &stale {
+            h.push_str(&format!("  {id}  confidence {}\n", render_score(*decayed)));
+        }
+        h
+    };
+    Ok(CmdOk {
+        data: Value::Object(vec![
+            ("floor".to_string(), Value::int(floor)),
+            ("dry_run".to_string(), Value::Bool(!force)),
+            ("count".to_string(), Value::int(stale.len() as i64)),
+            ("memories".to_string(), Value::Array(items)),
+        ]),
         human,
         warnings,
     })

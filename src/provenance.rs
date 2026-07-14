@@ -520,6 +520,8 @@ mod tests {
             core: Some("opus-4.8".to_string()),
             rationale: None,
             scope: None,
+            confidence: None,
+            last_used: None,
             unknown_keys: vec![],
             body: body.to_string(),
         }

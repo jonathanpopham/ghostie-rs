@@ -97,6 +97,8 @@ Optional:
 | `core` | provenance: which model produced it (`opus-4.8`, `hermes-4-405b`) |
 | `rationale` | why the memory is necessary; the why-line surfaced on the recall card |
 | `scope` | retrieval scope: `global` (default when absent) or `project:<name>` |
+| `confidence` | lifecycle: confidence in micro-units (0..1000000; full when absent). Decays on a half-life without reuse; `recall --touch` restores it |
+| `last_used` | lifecycle: UTC RFC3339 instant the memory was last used/revalidated; the reference point for decay (falls back to `created` when absent) |
 
 Type-scoping is warn-not-error: `supersedes` on a non-decision or `source`
 on a non-session-summary parses fine and is preserved, but validation
@@ -117,8 +119,8 @@ Canonical form is:
 1. Line 1: `---` exactly.
 2. Frontmatter keys in **schema order**: `id`, `type`, `created`, `title`,
    `tags`, `links`, `source`, `supersedes`, `harness`, `core`, `rationale`,
-   `scope`, then unknown keys, in first-seen order. Absent/empty optional
-   fields are omitted entirely (no `tags: []` noise).
+   `scope`, `confidence`, `last_used`, then unknown keys, in first-seen order.
+   Absent/empty optional fields are omitted entirely (no `tags: []` noise).
 3. Exactly one space after the colon: `key: value`. List form
    `key: [a, b]`, one space after each comma, none inside the brackets.
 4. Closing `---` line immediately after the last key line (no blank lines

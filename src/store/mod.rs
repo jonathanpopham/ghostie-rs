@@ -258,6 +258,11 @@ impl Store {
             core: opt_plain(&new.core),
             rationale: opt_red(&new.rationale),
             scope: opt_plain(&new.scope),
+            // Lifecycle fields are unset at creation: absent == full confidence,
+            // and stamping them here would change every golden store file. They
+            // appear only once a memory is reused/marked (see `mark_used`).
+            confidence: None,
+            last_used: None,
             unknown_keys: Vec::new(),
             body: if on {
                 crate::redact::redact(&new.body).0
@@ -402,6 +407,57 @@ impl Store {
         })?;
         self.refresh_index_best_effort();
         Ok(())
+    }
+
+    /// `<root>/archive/` — where `prune` moves memories that have decayed below
+    /// the floor. Archiving is not deleting: the file (and its git history)
+    /// survive, they simply leave `memories/` so recall stops surfacing them.
+    pub fn archive_dir(&self) -> PathBuf {
+        self.root.join("archive")
+    }
+
+    /// Move a memory out of `memories/` into `<root>/archive/`, preserving the
+    /// bytes. Used by `prune`. Errors if the memory does not exist.
+    pub fn archive(&self, id: &str) -> Result<PathBuf> {
+        let from = self.memory_path(id);
+        if !from.exists() {
+            return Err(Error::Invalid {
+                origin: from.display().to_string(),
+                message: format!("cannot archive '{id}': no such memory"),
+            });
+        }
+        let dir = self.archive_dir();
+        let dir_existed = dir.exists();
+        std::fs::create_dir_all(&dir).map_err(|e| Error::Io {
+            context: "creating archive directory".to_string(),
+            path: dir.display().to_string(),
+            source: e,
+        })?;
+        if !dir_existed {
+            set_private(&dir, true);
+        }
+        let to = dir.join(format!("{id}.md"));
+        std::fs::rename(&from, &to).map_err(|e| Error::Io {
+            context: format!("archiving memory '{id}'"),
+            path: to.display().to_string(),
+            source: e,
+        })?;
+        self.refresh_index_best_effort();
+        Ok(to)
+    }
+
+    /// Mark a memory as used/revalidated: stamp `last_used` from the injected
+    /// clock and restore `confidence` to full. This is the reset that decay
+    /// measures against — recall `--touch` and any explicit "still relevant"
+    /// signal route through here. Errors if the memory does not exist.
+    pub fn mark_used(&self, id: &str, clock: &dyn Clock) -> Result<Memory> {
+        let (mut memory, _warnings) = self.read(id)?;
+        memory.last_used = Some(clock.now_epoch_seconds());
+        memory.confidence = Some(crate::decay::FULL_CONFIDENCE_MICROS);
+        self.write_atomic(&memory)?;
+        self.append_provenance_best_effort(&memory, crate::provenance::Event::Updated, clock);
+        self.refresh_index_best_effort();
+        Ok(memory)
     }
 
     /// All memories in deterministic order (id lexicographic ascending),

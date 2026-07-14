@@ -15,6 +15,7 @@
 pub mod capture;
 pub mod cli;
 pub mod codex;
+pub mod decay;
 pub mod distill;
 mod error;
 pub mod hook;
